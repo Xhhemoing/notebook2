@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useMemo, useCallback } from 'react';
 import { useAppContext } from '@/lib/store';
-import { Database, UploadCloud, FileText, Image as ImageIcon, File, Trash2, Download, Search, HardDrive, Folder, ChevronRight, FolderPlus, AlertTriangle, ShieldAlert, Pin, PinOff, Zap } from 'lucide-react';
+import { Database, UploadCloud, FileText, Image as ImageIcon, File as GenericFile, Trash2, Download, Search, HardDrive, Folder, ChevronRight, FolderPlus, AlertTriangle, ShieldAlert, Pin, PinOff, Zap } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { Resource } from '@/lib/types';
 import { clsx } from 'clsx';
@@ -250,7 +250,7 @@ export function ResourceLibrary() {
     if (isFolder) return <Folder className="w-10 h-10 text-amber-400" fill="currentColor" fillOpacity={0.2} />;
     if (type.startsWith('image/')) return <ImageIcon className="w-8 h-8 text-emerald-400" />;
     if (type.includes('pdf')) return <FileText className="w-8 h-8 text-rose-400" />;
-    return <File className="w-8 h-8 text-indigo-400" />;
+    return <GenericFile className="w-8 h-8 text-indigo-400" />;
   };
 
   const currentResources = useMemo(() => {

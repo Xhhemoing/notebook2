@@ -15,7 +15,7 @@ export function ModelSelector({ value, onChange, className = '' }: { value: stri
     (provider.models || [])
       .filter(m => m.isFavorite)
       .map(m => ({
-        id: m.id,
+        id: `${provider.id}:${m.id}`,
         name: `${provider.name} - ${m.name}`
       }))
   );
