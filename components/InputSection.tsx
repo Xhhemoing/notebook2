@@ -1108,7 +1108,7 @@ export function InputSection() {
   }
 
   return (
-    <div className="w-full p-4 md:p-6 xl:px-8 space-y-5 text-slate-200">
+    <div className="w-full h-full overflow-y-auto scroll-smooth custom-scrollbar p-4 md:p-6 xl:px-8 space-y-5 text-slate-200">
       <div className="rounded-3xl border border-slate-800 bg-slate-950 p-4 md:p-6 shadow-2xl">
         <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
           <div>

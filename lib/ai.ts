@@ -36,7 +36,7 @@ export async function getEmbedding(
   content: string | { data: string, mimeType: string } | (string | { inlineData: { data: string, mimeType: string } })[],
   settings?: Settings
 ): Promise<number[]> {
-  const modelId = settings?.embeddingModel || 'gemini-embedding-2-preview';
+  const modelId = settings?.embeddingModel || 'text-embedding-004';
   const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(modelId, settings || {} as Settings);
 
   let contents: any[];

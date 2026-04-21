@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { useAppContext } from '@/lib/store';
 import { generateQuizzes, QuizQuestion } from '@/lib/ai';
 import { Memory } from '@/lib/types';
-import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen } from 'lucide-react';
+import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen, Download } from 'lucide-react';
 import { clsx } from 'clsx';
 import { reviewCard, Rating, Grade, calculateMetrics } from '@/lib/fsrs';
 import Markdown from 'react-markdown';
@@ -21,6 +21,10 @@ export function ReviewSection() {
   const [submitted, setSubmitted] = useState(false);
   const [started, setStarted] = useState(false);
   const [isJoint, setIsJoint] = useState(false);
+  const [reviewMode, setReviewMode] = useState<'standard' | 'instant'>('standard');
+  const [customBatchSize, setCustomBatchSize] = useState(3);
+  const [customDifficulty, setCustomDifficulty] = useState(5);
+  const [isPrinting, setIsPrinting] = useState(false);
 
   const memoriesToReview = state.memories
     .filter(m => m.subject === state.currentSubject)
@@ -42,19 +46,14 @@ export function ReviewSection() {
   const startReview = async () => {
     if (memoriesToReview.length === 0) return;
     
-    // Check daily limit
-    const today = new Date().setHours(0, 0, 0, 0);
-    const reviewedToday = state.memories.filter(m => m.lastReviewed && m.lastReviewed >= today).length;
-    const limit = state.settings.dailyReviewLimit || 20;
-    
-    if (reviewedToday >= limit) {
-      alert('今日复习量已达上限，休息一下明天再来吧！');
-      return;
-    }
-
-    const remainingQuota = limit - reviewedToday;
-    const batchSize = Math.min(state.settings.reviewBatchSize || 3, remainingQuota);
+    // Use custom settings if available
+    const batchSize = Math.min(memoriesToReview.length, customBatchSize);
     const selectedMemories = memoriesToReview.slice(0, batchSize);
+    const effectiveSettings = {
+      ...state.settings,
+      minReviewDifficulty: Math.max(0, customDifficulty - 2),
+      maxReviewDifficulty: Math.min(10, customDifficulty + 2)
+    };
     
     setMemories(selectedMemories);
     setLoading(true);
@@ -65,7 +64,7 @@ export function ReviewSection() {
     setQuizzes([]);
 
     try {
-      const generatedQuizzes = await generateQuizzes(selectedMemories, state.knowledgeNodes, state.settings, isJoint, (log) => {
+      const generatedQuizzes = await generateQuizzes(selectedMemories, state.knowledgeNodes, effectiveSettings, isJoint, (log) => {
         if (state.settings.enableLogging) {
           dispatch({
             type: 'ADD_LOG',
@@ -87,6 +86,19 @@ export function ReviewSection() {
 
   const handleAnswerChange = (quizIdx: number, answer: string) => {
     setAnswers(prev => ({ ...prev, [quizIdx]: answer }));
+    
+    // If instant feedback mode, evaluate immediately for MC and TF
+    if (reviewMode === 'instant') {
+      const quiz = quizzes[quizIdx];
+      if (quiz.type !== 'qa') {
+        const isCorrect = answer === quiz.correctAnswer;
+        setEvaluations(prev => ({ ...prev, [quizIdx]: isCorrect ? Rating.Good : Rating.Again }));
+      }
+    }
+  };
+
+  const handlePrint = () => {
+    window.print();
   };
 
   const handleSubmit = () => {
@@ -188,6 +200,73 @@ export function ReviewSection() {
           <div className="flex items-center justify-center gap-4 p-4 bg-slate-900/40 rounded-xl border border-slate-800">
             <div className="flex flex-col items-start">
               <span className="text-sm font-semibold text-slate-300 flex items-center gap-1">
+                <Play className="w-4 h-4 text-emerald-400" />
+                复习模式
+              </span>
+              <span className="text-xs text-slate-500">
+                {reviewMode === 'standard' ? '全部答完后统一提交查看反馈' : '每答一题立即获得反馈'}
+              </span>
+            </div>
+            <div className="flex bg-slate-800 p-1 rounded-lg">
+              <button
+                onClick={() => setReviewMode('standard')}
+                className={clsx(
+                  "px-3 py-1 text-xs rounded-md transition-all",
+                  reviewMode === 'standard' ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"
+                )}
+              >
+                标准
+              </button>
+              <button
+                onClick={() => setReviewMode('instant')}
+                className={clsx(
+                  "px-3 py-1 text-xs rounded-md transition-all",
+                  reviewMode === 'instant' ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"
+                )}
+              >
+                即时
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="p-4 bg-slate-900/40 rounded-xl border border-slate-800 space-y-2">
+              <label className="text-xs font-semibold text-slate-400 uppercase flex items-center gap-1">
+                本次题目数量
+              </label>
+              <input 
+                type="range" min="1" max="10" step="1" 
+                value={customBatchSize} 
+                onChange={(e) => setCustomBatchSize(Number(e.target.value))}
+                className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500">
+                <span>1</span>
+                <span className="text-indigo-400 font-bold">{customBatchSize} 题</span>
+                <span>10</span>
+              </div>
+            </div>
+            <div className="p-4 bg-slate-900/40 rounded-xl border border-slate-800 space-y-2">
+              <label className="text-xs font-semibold text-slate-400 uppercase flex items-center gap-1">
+                难度系数
+              </label>
+              <input 
+                type="range" min="1" max="10" step="1" 
+                value={customDifficulty} 
+                onChange={(e) => setCustomDifficulty(Number(e.target.value))}
+                className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500">
+                <span>易</span>
+                <span className="text-amber-400 font-bold">Lv.{customDifficulty}</span>
+                <span>难</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-center gap-4 p-4 bg-slate-900/40 rounded-xl border border-slate-800">
+            <div className="flex flex-col items-start">
+              <span className="text-sm font-semibold text-slate-300 flex items-center gap-1">
                 <Layers className="w-4 h-4 text-indigo-400" />
                 联合命题模式
               </span>
@@ -222,22 +301,64 @@ export function ReviewSection() {
   }
 
   return (
-    <div className="p-6 h-full flex flex-col max-w-4xl mx-auto overflow-y-auto bg-black text-slate-200 custom-scrollbar">
-      <div className="flex items-center justify-between mb-8 shrink-0">
+    <div className="p-6 h-full flex flex-col max-w-4xl mx-auto overflow-y-auto bg-black text-slate-200 custom-scrollbar print:overflow-visible print:p-0 print:bg-white print:text-black">
+      <style jsx global>{`
+        @media print {
+          nav, aside, button:not(.print-only), .no-print {
+            display: none !important;
+          }
+          body {
+            background: white !important;
+          }
+          .quiz-card {
+            border: 1px solid #ddd !important;
+            margin-bottom: 2rem !important;
+            page-break-inside: avoid;
+            padding: 2rem !important;
+            background: white !important;
+            color: black !important;
+          }
+          .quiz-card * {
+            color: black !important;
+          }
+          .print-header {
+            display: block !important;
+            margin-bottom: 2rem;
+            color: black !important;
+          }
+        }
+        .print-header { display: none; }
+      `}</style>
+      
+      <div className="print-header">
+        <h1 className="text-2xl font-bold">{state.currentSubject} - 专项练习测试卷</h1>
+        <p className="text-sm text-slate-500">日期: {new Date().toLocaleDateString()} | 题目数量: {quizzes.length}</p>
+      </div>
+
+      <div className="flex items-center justify-between mb-8 shrink-0 no-print">
         <h2 className="text-xl font-semibold text-white flex items-center gap-2">
           <GraduationCap className="w-5 h-5 text-indigo-400" />
           综合复习测试
         </h2>
-        {submitted && (
+        <div className="flex gap-2">
           <button
-            onClick={handleFinish}
-            disabled={Object.keys(evaluations).length < quizzes.length}
-            className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={handlePrint}
+            className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-sm font-medium transition-colors"
           >
-            完成复习并保存
-            <ArrowRight className="w-4 h-4" />
+            <Download className="w-4 h-4" />
+            导出纸质版
           </button>
-        )}
+          {submitted && (
+            <button
+              onClick={handleFinish}
+              disabled={Object.keys(evaluations).length < quizzes.length}
+              className="flex items-center gap-2 px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              完成复习并保存
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          )}
+        </div>
       </div>
 
       {loading ? (
@@ -270,13 +391,20 @@ export function ReviewSection() {
                       </span>
                     )}
                   </div>
-                  <div className="text-lg font-medium text-slate-200 leading-relaxed prose prose-invert prose-sm max-w-none">
+
+                  <div className="text-lg font-medium text-slate-200 leading-relaxed prose prose-invert prose-sm max-w-none mb-6">
                     <Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{quiz.question}</Markdown>
+                  </div>
+
+                  <div className="flex items-center gap-2 text-indigo-400 mb-6 no-print">
+                    <span className="text-xs font-bold uppercase tracking-widest">
+                      {reviewMode === 'instant' ? '即时练习模式' : '标准答题模式'}
+                    </span>
                   </div>
                 </div>
 
-                {!submitted ? (
-                  <div className="space-y-3">
+                {!submitted && (reviewMode === 'standard' || evaluation === undefined) ? (
+                    <div className="space-y-3">
                     {quiz.type === 'mc' && quiz.options?.map((opt, i) => (
                       <button
                         key={i}

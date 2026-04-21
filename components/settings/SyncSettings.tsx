@@ -35,13 +35,20 @@ export default function SyncSettings() {
   };
 
   const handleExport = () => {
-    const dataStr = JSON.stringify(state, null, 2);
-    const dataUri = 'data:application/json;charset=utf-8,' + encodeURIComponent(dataStr);
-    const exportFileDefaultName = `aistudio-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    const linkElement = document.createElement('a');
-    linkElement.setAttribute('href', dataUri);
-    linkElement.setAttribute('download', exportFileDefaultName);
-    linkElement.click();
+    try {
+      const dataStr = JSON.stringify(state, null, 2);
+      const blob = new Blob([dataStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const exportFileDefaultName = `aistudio-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      const linkElement = document.createElement('a');
+      linkElement.setAttribute('href', url);
+      linkElement.setAttribute('download', exportFileDefaultName);
+      linkElement.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('Export failed', e);
+      alert('导出失败，请检查数据大小或浏览器限制。');
+    }
   };
 
   const processImport = (file: File) => {
@@ -128,23 +135,48 @@ export default function SyncSettings() {
 
       {/* ── Cloudflare D1 云同步 ── */}
       <section className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-sm">
-        <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4 flex items-center gap-2">
-          <Cloud className="w-4 h-4" />
-          Cloudflare D1 云端同步
-        </h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+            <Cloud className="w-4 h-4" />
+            Cloudflare D1 云端同步
+          </h3>
+          <button 
+            onClick={() => window.open('https://github.com/Xhhemoing/notebook2#%E9%83%A8%E7%BD%B2%E6%8C%87%E5%8D%97', '_blank')}
+            className="text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition-colors"
+          >
+            部署指南
+          </button>
+        </div>
+        
         <div className="space-y-4">
+          <div className="p-4 bg-amber-950/20 border border-amber-900/30 rounded-xl mb-4">
+            <p className="text-xs text-amber-200/80 leading-5">
+              <strong>部署说明：</strong> 本同步功能基于 Cloudflare D1。
+              1. 在 Cloudflare 创建 D1 数据库并绑定为 <code className="bg-slate-900 px-1 rounded text-white">DB</code>。
+              2. 确保项目中有 <code className="bg-slate-900 px-1 rounded text-white">app/api/sync/route.ts</code>。
+              3. 填入下方 <strong>Sync Key</strong>，它相当于你的私人保险箱密码，不同 Key 之间数据完全隔离。
+            </p>
+          </div>
+
           <div className="space-y-2">
             <label className="text-xs font-medium text-slate-400 flex items-center gap-1">
               数据隔离密钥 (Sync Key)
-              <span className="text-[10px] text-slate-500 font-normal">(必填，用于隔离多用户数据，不可泄露)</span>
+              <span className="text-[10px] text-slate-500 font-normal">(必填，用于隔离多用户数据，建议包含字母数字)</span>
             </label>
-            <input
-              type="password"
-              value={state.settings.syncKey || ''}
-              onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { syncKey: e.target.value } })}
-              placeholder="输入至少4位同步密钥（类似密码）"
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
-            />
+            <div className="relative">
+              <input
+                type="password"
+                value={state.settings.syncKey || ''}
+                onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { syncKey: e.target.value } })}
+                placeholder="例如: my-secret-vault-2024"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
+              />
+              {(!state.settings.syncKey || state.settings.syncKey.length < 4) && (
+                <p className="mt-1.5 text-[10px] text-rose-500 animate-pulse">
+                  ⚠️ 缺少同步密钥或密钥过短，同步已禁用。
+                </p>
+              )}
+            </div>
           </div>
           <p className="text-xs text-slate-500">
             核心常用数据仍会优先缓存在本地以保证读取速度，全量数据将异步同步至 D1 数据库。自动同步功能会定期执行。
