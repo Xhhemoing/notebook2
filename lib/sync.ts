@@ -6,8 +6,8 @@ interface SyncRequest {
   syncKey: string;
 }
 
-export async function pushToCloudflare(state: AppState, url: string, token: string) {
-  const endpoint = `${url.replace(/\/$/, '')}/api/sync`;
+export async function pushToCloudflare(state: AppState) {
+  const endpoint = '/api/sync';
   const syncKey = state.settings.syncKey || '';
   
   if (!syncKey) {
@@ -19,8 +19,7 @@ export async function pushToCloudflare(state: AppState, url: string, token: stri
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({ action, payload, syncKey })
     });
@@ -42,8 +41,8 @@ export async function pushToCloudflare(state: AppState, url: string, token: stri
   return { success: true };
 }
 
-export async function pullFromCloudflare(url: string, token: string, syncKey: string): Promise<AppState | null> {
-  const endpoint = `${url.replace(/\/$/, '')}/api/sync`;
+export async function pullFromCloudflare(syncKey: string): Promise<AppState | null> {
+  const endpoint = '/api/sync';
   
   if (!syncKey) {
     throw new Error('Sync Key is required for cloud synchronization.');
@@ -52,8 +51,7 @@ export async function pullFromCloudflare(url: string, token: string, syncKey: st
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({ 
       action: 'pull', 

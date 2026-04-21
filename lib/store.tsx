@@ -94,20 +94,18 @@ export async function clearLocalAppData() {
 }
 
 export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Action>) {
-  if (typeof window === 'undefined' || window.location.hostname === 'localhost') return;
+  if (typeof window === 'undefined') return;
 
   try {
-    const authToken = state.settings.cloudflareToken?.trim();
     const syncKey = state.settings.syncKey?.trim();
 
-    if (!authToken || !syncKey) {
-      console.warn('D1 Sync skipped: missing cloudflareToken or syncKey');
+    if (!syncKey) {
+      console.warn('D1 Sync skipped: missing syncKey');
       return;
     }
 
     const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${authToken}`,
+      'Content-Type': 'application/json'
     };
 
     // 1. Pull incremental changes

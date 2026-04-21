@@ -15,10 +15,10 @@ export default function SyncSettings() {
     setSyncing(direction);
     try {
       if (direction === 'push') {
-        const success = await pushToCloudflare(state, state.settings.cloudflareEndpoint || '', state.settings.cloudflareToken || '');
+        const success = await pushToCloudflare(state);
         alert(success ? '同步到云端成功！' : '同步到云端失败，请检查配置。');
       } else {
-        const cloudState = await pullFromCloudflare(state.settings.cloudflareEndpoint || '', state.settings.cloudflareToken || '', state.settings.syncKey || '');
+        const cloudState = await pullFromCloudflare(state.settings.syncKey || '');
         if (cloudState) {
           dispatch({ type: 'LOAD_STATE', payload: cloudState });
           alert('从云端恢复成功！');
@@ -26,9 +26,9 @@ export default function SyncSettings() {
           alert('从云端恢复失败，可能云端没有数据或配置错误。');
         }
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Sync error:', error);
-      alert('同步过程中发生错误。');
+      alert('同步过程中发生错误: ' + error.message);
     } finally {
       setSyncing(null);
     }
@@ -133,43 +133,21 @@ export default function SyncSettings() {
           Cloudflare D1 云端同步
         </h3>
         <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="text-xs font-medium text-slate-400">API Endpoint</label>
-              <input
-                type="text"
-                value={state.settings.cloudflareEndpoint || ''}
-                onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { cloudflareEndpoint: e.target.value } })}
-                placeholder="https://your-worker.workers.dev"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-xs font-medium text-slate-400">API Token</label>
-              <input
-                type="password"
-                value={state.settings.cloudflareToken || ''}
-                onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { cloudflareToken: e.target.value } })}
-                placeholder="••••••••••••••••"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
-              />
-            </div>
-            <div className="space-y-2 md:col-span-2">
-              <label className="text-xs font-medium text-slate-400 flex items-center gap-1">
-                数据隔离密钥 (Sync Key)
-                <span className="text-[10px] text-slate-500 font-normal">(用于隔离多用户数据，不可泄露)</span>
-              </label>
-              <input
-                type="password"
-                value={state.settings.syncKey || ''}
-                onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { syncKey: e.target.value } })}
-                placeholder="输入您的私有同步密钥"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
-              />
-            </div>
+          <div className="space-y-2">
+            <label className="text-xs font-medium text-slate-400 flex items-center gap-1">
+              数据隔离密钥 (Sync Key)
+              <span className="text-[10px] text-slate-500 font-normal">(必填，用于隔离多用户数据，不可泄露)</span>
+            </label>
+            <input
+              type="password"
+              value={state.settings.syncKey || ''}
+              onChange={(e) => dispatch({ type: 'UPDATE_SETTINGS', payload: { syncKey: e.target.value } })}
+              placeholder="输入至少4位同步密钥（类似密码）"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-indigo-500 transition-colors text-slate-200"
+            />
           </div>
           <p className="text-xs text-slate-500">
-            核心常用数据仍会优先缓存在本地以保证读取速度，全量数据将异步同步至 D1。
+            核心常用数据仍会优先缓存在本地以保证读取速度，全量数据将异步同步至 D1 数据库。自动同步功能会定期执行。
           </p>
 
           <div className="flex items-center justify-between p-4 bg-indigo-950/30 border border-indigo-900/30 rounded-xl">
@@ -180,7 +158,7 @@ export default function SyncSettings() {
             <div className="flex gap-2">
               <button
                 onClick={() => handleSync('pull')}
-                disabled={syncing !== null || !state.settings.cloudflareEndpoint}
+                disabled={syncing !== null || (state.settings.syncKey?.length ?? 0) < 4}
                 className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
               >
                 {syncing === 'pull' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
@@ -188,7 +166,7 @@ export default function SyncSettings() {
               </button>
               <button
                 onClick={() => handleSync('push')}
-                disabled={syncing !== null || !state.settings.cloudflareEndpoint}
+                disabled={syncing !== null || (state.settings.syncKey?.length ?? 0) < 4}
                 className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
               >
                 {syncing === 'push' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}

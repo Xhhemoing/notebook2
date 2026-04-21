@@ -2,7 +2,7 @@
 
 import { useAppContext } from '@/lib/store';
 import { BookX, Trash2, CheckCircle, Info, Edit, Search, Filter, X, ChevronLeft, ChevronRight, GitCommit, Tag } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { clsx } from 'clsx';
 import { ImageModal } from './ImageModal';
 import Markdown from 'react-markdown';
@@ -37,16 +37,20 @@ export function MistakeBook() {
   const totalPages = Math.ceil(mistakes.length / itemsPerPage);
   const paginatedMistakes = mistakes.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
 
-  const handleEdit = (memory: any) => {
+  const handleEdit = useCallback((memory: any) => {
     setEditingId(memory.id);
     setEditContent(memory.content);
     setEditNotes(memory.notes || '');
     setEditWrongAnswer(memory.wrongAnswer || '');
     setEditErrorReason(memory.errorReason || '');
     setEditImageUrl(memory.imageUrl || '');
-  };
+  }, []);
 
-  const handleSaveEdit = (memory: any) => {
+  const handleSaveEdit = useCallback((memory: any) => {
+    // Generate these values ONLY when called
+    const eventId = uuidv4();
+    const now = Date.now();
+
     dispatch({
       type: 'UPDATE_MEMORY',
       payload: { 
@@ -61,8 +65,8 @@ export function MistakeBook() {
     dispatch({
       type: 'ADD_FEEDBACK_EVENT',
       payload: {
-        id: uuidv4(),
-        timestamp: Date.now(),
+        id: eventId,
+        timestamp: now,
         subject: state.currentSubject,
         targetType: 'memory',
         targetId: memory.id,
@@ -75,16 +79,18 @@ export function MistakeBook() {
       }
     });
     setEditingId(null);
-  };
+  }, [editContent, editNotes, editWrongAnswer, editErrorReason, editImageUrl, state.currentSubject, dispatch]);
 
-  const toggleMistake = (id: string, currentStatus: boolean | undefined) => {
+  const toggleMistake = useCallback((id: string, currentStatus: boolean | undefined) => {
     const memory = state.memories.find(m => m.id === id);
     if (memory) {
+      const eventId = uuidv4();
+      const now = Date.now();
       dispatch({
         type: 'ADD_FEEDBACK_EVENT',
         payload: {
-          id: uuidv4(),
-          timestamp: Date.now(),
+          id: eventId,
+          timestamp: now,
           subject: state.currentSubject,
           targetType: 'memory',
           targetId: id,
@@ -98,7 +104,7 @@ export function MistakeBook() {
       });
       dispatch({ type: 'UPDATE_MEMORY', payload: { ...memory, isMistake: !currentStatus } });
     }
-  };
+  }, [state.memories, state.currentSubject, dispatch]);
 
   const handleApproveProposal = (memoryId: string, proposal: any) => {
     if (!proposal.suggestedNodeName) {
@@ -304,11 +310,13 @@ export function MistakeBook() {
                           </button>
                           <button
                             onClick={() => {
+                              const eventId = uuidv4();
+                              const now = Date.now();
                               dispatch({
                                 type: 'ADD_FEEDBACK_EVENT',
                                 payload: {
-                                  id: uuidv4(),
-                                  timestamp: Date.now(),
+                                  id: eventId,
+                                  timestamp: now,
                                   subject: state.currentSubject,
                                   targetType: 'memory',
                                   targetId: memory.id,

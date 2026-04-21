@@ -10,12 +10,8 @@ export async function POST(req: NextRequest) {
     const { action, payload, syncKey } = data;
 
     // 1. Basic Security Checks
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return NextResponse.json({ error: 'Missing or invalid Authorization header' }, { status: 401 });
-    }
-
     if (!syncKey || typeof syncKey !== 'string' || syncKey.length < 4) {
-      return NextResponse.json({ error: 'Valid Sync Key is required for data isolation' }, { status: 400 });
+      return NextResponse.json({ error: 'Valid Sync Key (min 4 chars) is required for data isolation' }, { status: 400 });
     }
 
     // Access the D1 database binding

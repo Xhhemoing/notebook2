@@ -30,11 +30,14 @@ import { getAutoExpireAt } from '@/lib/feedback';
 import { normalizeInputHistoryItem, normalizeInputHistoryWorkflow } from '@/lib/input-history';
 import { InputHistoryItem, IngestionMode, Resource, UserFeedbackEvent } from '@/lib/types';
 import { ModelSelector } from '@/components/ModelSelector';
+import { ImageAnnotator, ImageAnnotation } from '@/components/ImageAnnotator';
 
 type DraftAsset = {
   resourceId: string;
   name: string;
   preview: string;
+  annotatedPreview?: string;
+  visualAnnotations?: ImageAnnotation[];
   type: string;
   size: number;
 };
@@ -361,8 +364,6 @@ function getManualHighlightLabel(highlight: ManualHighlight) {
 }
 
 function buildManualHighlightsInstruction(highlights: ManualHighlight[], assets: DraftAsset[]) {
-  if (highlights.length === 0) return '';
-
   const assetNameMap = new Map(assets.map((asset) => [asset.resourceId, asset.name]));
   const lines = ['【用户手动重点标注】'];
 
@@ -382,6 +383,17 @@ function buildManualHighlightsInstruction(highlights: ManualHighlight[], assets:
     const assetName = assetNameMap.get(highlight.resourceId || '') || '未命名图片';
     lines.push(`${index + 1}. 图片标注 [${assetName}] [${label}]：${note}`);
   });
+
+  assets.forEach((asset) => {
+    if (asset.visualAnnotations && asset.visualAnnotations.length > 0) {
+      lines.push(`\n图片 [${asset.name}] 上的视觉标点:`);
+      asset.visualAnnotations.forEach((a) => {
+        lines.push(`- 标号 ${a.number} [${a.kind === 'mistake' ? '错题' : a.kind === 'memory' ? '记忆' : a.kind === 'explain' ? '需解释' : '重点'}]：${a.note || '请重点关注此区域'}`);
+      });
+    }
+  });
+
+  if (highlights.length === 0 && lines.length === 1) return '';
 
   lines.push('请优先遵循以上手动标注，不要忽略用户明确指定的重点、错题、解释或自定义处理意图。');
   return lines.join('\n');
@@ -530,6 +542,7 @@ export function InputSection() {
   const [explicitPurpose, setExplicitPurpose] = useState<string>('auto');
   const [markAsMistake, setMarkAsMistake] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [annotatorAssetId, setAnnotatorAssetId] = useState<string | null>(null);
   const [imageOptions, setImageOptions] = useState({
     enhanceImage: true,
     preserveAnnotations: true,
@@ -760,7 +773,7 @@ export function InputSection() {
           state.currentSubject,
           state.knowledgeNodes,
           { ...state.settings, parseModel: selectedModel },
-          draftAssets.length > 0 ? draftAssets.map((asset) => asset.preview) : undefined,
+          draftAssets.length > 0 ? draftAssets.map((asset) => asset.annotatedPreview || asset.preview) : undefined,
           explicitFunction !== 'auto' ? explicitFunction : undefined,
           explicitPurpose !== 'auto' ? explicitPurpose : undefined,
           regenerate ? pendingReview?.parsedItems : undefined,
@@ -1469,10 +1482,20 @@ export function InputSection() {
                           <X className="h-4 w-4" />
                         </button>
                       </div>
-                      <div className="mt-3 aspect-video overflow-hidden rounded-xl border border-slate-800 bg-slate-900">
+                      <div className="mt-3 relative aspect-video overflow-hidden rounded-xl border border-slate-800 bg-slate-900 group">
                         {asset.preview.startsWith('data:image') ? (
-                          // eslint-disable-next-line @next/next/no-img-element
-                          <img src={asset.preview} alt={asset.name} className="h-full w-full object-cover" />
+                          <>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={asset.annotatedPreview || asset.preview} alt={asset.name} className="h-full w-full object-cover" />
+                            <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                              <button
+                                onClick={() => setAnnotatorAssetId(asset.resourceId)}
+                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-xl transition-all"
+                              >
+                                精致标注
+                              </button>
+                            </div>
+                          </>
                         ) : (
                           <div className="flex h-full items-center justify-center text-slate-500">
                             <FileText className="h-6 w-6" />
@@ -1761,6 +1784,22 @@ export function InputSection() {
             </div>
           )}
         </div>
+      )}
+
+      {annotatorAssetId && (
+        <ImageAnnotator
+          src={draftAssets.find(a => a.resourceId === annotatorAssetId)?.preview || ''}
+          initialAnnotations={draftAssets.find(a => a.resourceId === annotatorAssetId)?.visualAnnotations || []}
+          onSave={(annotatedImageBase64, annotations) => {
+            setDraftAssets(prev => prev.map(a => 
+              a.resourceId === annotatorAssetId 
+                ? { ...a, annotatedPreview: annotatedImageBase64, visualAnnotations: annotations } 
+                : a
+            ));
+            setAnnotatorAssetId(null);
+          }}
+          onCancel={() => setAnnotatorAssetId(null)}
+        />
       )}
 
     </div>
