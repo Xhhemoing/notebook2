@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { generateObjectWithFallback } from '@/lib/ai/config';
 import { z } from 'zod';
 
+export const runtime = 'edge';
+
 // In a real app, this would be a database like D1, Postgres, or Firestore
 // Using a global variable for simple in-memory task tracking during dev
 declare global {

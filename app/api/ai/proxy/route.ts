@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-export const runtime = 'nodejs';
+export const runtime = 'edge';
 
 function truncate(value: string, max = 400) {
   return value.length > max ? `${value.slice(0, max)}...` : value;

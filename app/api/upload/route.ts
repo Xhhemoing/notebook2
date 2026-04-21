@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { Client } from '@upstash/qstash';
 
+export const runtime = 'edge';
+
 const qstash = new Client({
   token: process.env.QSTASH_TOKEN || 'mock_token_for_dev',
 });
