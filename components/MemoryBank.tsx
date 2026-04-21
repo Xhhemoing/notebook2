@@ -165,8 +165,8 @@ export function MemoryBank() {
   const indexedCount = useMemo(() => memories.filter(m => m.embedding).length, [memories]);
 
   return (
-    <div className="p-2 h-full flex flex-col max-w-6xl mx-auto text-slate-200 bg-black">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 mb-3">
+    <div className="p-0 sm:p-2 h-full flex flex-col w-full max-w-full text-slate-200 bg-black overflow-hidden">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 px-4 py-3 mb-1 border-b border-slate-900 bg-slate-950/50 backdrop-blur-md">
         <div className="flex items-center gap-2.5">
           <div className="w-7 h-7 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-center shadow-2xl">
             <BrainCircuit className="w-4 h-4 text-indigo-500" />
@@ -299,7 +299,7 @@ export function MemoryBank() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-2 px-2 md:px-4">
         <div className="relative md:col-span-2 flex gap-2">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 text-slate-600" />
@@ -343,7 +343,7 @@ export function MemoryBank() {
         </select>
       </div>
 
-      <div ref={parentRef} className="flex-1 overflow-y-auto pb-6 custom-scrollbar">
+      <div ref={parentRef} className="flex-1 overflow-y-auto pb-6 px-2 md:px-4 custom-scrollbar">
         {memories.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 bg-slate-900/20 rounded-[2rem] border border-dashed border-slate-900">
             <div className="w-16 h-16 bg-slate-900 rounded-2xl flex items-center justify-center mb-6 border border-slate-800">

@@ -487,17 +487,16 @@ export function KnowledgeGraph() {
   };
 
   return (
-    <div className="p-4 h-full flex flex-col bg-black text-slate-200">
-      <div className="flex items-center justify-between mb-3">
+    <div className="p-0 sm:p-2 h-full flex flex-col bg-black text-slate-200 overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-slate-900 bg-slate-950/50 backdrop-blur-md">
         <div className="flex items-center gap-3">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+          <h2 className="text-sm md:text-base font-bold text-white flex items-center gap-2 uppercase tracking-tight">
             <BrainCircuit className="w-4 h-4 text-indigo-400" />
-            {state.currentSubject} 知识图谱
-            <span className="text-[10px] font-normal text-slate-400 bg-slate-800 px-1.5 py-0.5 rounded">支持拖拽、滚轮缩放、点击折叠</span>
+            <span className="truncate">{state.currentSubject} 知识图谱</span>
           </h2>
         </div>
-        <div className="flex items-center gap-3">
-          <div className="flex bg-slate-800 p-1 rounded-lg">
+        <div className="flex items-center gap-2">
+          <div className="flex bg-slate-900/50 border border-slate-800 p-0.5 rounded-lg">
             {viewMode === 'graph' && (
               <button
                 onClick={() => {
@@ -505,49 +504,49 @@ export function KnowledgeGraph() {
                     d3.select(svgRef.current).transition().duration(750).call(zoomRef.current.transform, d3.zoomIdentity);
                   }
                 }}
-                className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-slate-400 hover:text-slate-300 transition-colors"
+                className="hidden md:flex items-center gap-1 px-2 py-1 text-[9px] font-black text-slate-500 hover:text-slate-300 transition-colors uppercase tracking-widest"
                 title="重置缩放和位置"
               >
                 <Maximize className="w-3 h-3" />
-                重置视图
+                RESET
               </button>
             )}
             {state.lastNodesState && (
               <button
                 onClick={() => dispatch({ type: 'UNDO_NODES' })}
-                className="flex items-center gap-1 px-2 py-1 text-[10px] font-bold text-amber-400 hover:text-amber-300 transition-colors"
+                className="flex items-center gap-1 px-2 py-1 text-[9px] font-black text-amber-500 hover:text-amber-400 transition-colors uppercase tracking-widest"
                 title="撤销上次 AI 调整"
               >
                 <RotateCcw className="w-3 h-3" />
-                撤销调整
+                UNDO
               </button>
             )}
             <button
               onClick={() => setViewMode('graph')}
               className={clsx(
-                "px-3 py-1 text-xs font-medium rounded-md transition-all",
-                viewMode === 'graph' ? "bg-slate-700 shadow-sm text-indigo-400" : "text-slate-400 hover:text-slate-300"
+                "px-2 md:px-3 py-1 text-[9px] md:text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
+                viewMode === 'graph' ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"
               )}
             >
-              导图视图
+              GRAPH
             </button>
             <button
               onClick={() => setViewMode('outline')}
               className={clsx(
-                "px-3 py-1 text-xs font-medium rounded-md transition-all",
-                viewMode === 'outline' ? "bg-slate-700 shadow-sm text-indigo-400" : "text-slate-400 hover:text-slate-300"
+                "px-2 md:px-3 py-1 text-[9px] md:text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
+                viewMode === 'outline' ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"
               )}
             >
-              大纲视图
+              OUTLINE
             </button>
           </div>
         </div>
       </div>
       
-      <div className="flex-1 flex gap-4 overflow-hidden">
+      <div className="flex-1 flex flex-col lg:flex-row gap-0 overflow-hidden relative">
         <div 
           ref={containerRef}
-          className="flex-1 bg-slate-900 rounded-2xl shadow-sm border border-slate-800 overflow-hidden relative"
+          className="flex-1 bg-slate-950 border-b lg:border-b-0 border-slate-900 overflow-hidden relative min-h-[50vh] lg:min-h-0"
         >
           {viewMode === 'graph' ? (
             state.knowledgeNodes.filter(n => n.subject === state.currentSubject).length === 0 ? (

@@ -81,7 +81,7 @@ function MainLayout({ currentView, setCurrentView }: { currentView: View, setCur
       />
       <main className="flex-1 flex flex-col h-full overflow-hidden min-w-0">
         <SubjectSelector onMenuClick={() => setIsMobileMenuOpen(true)} />
-        <div className="flex-1 relative overflow-hidden">
+        <div className="flex-1 relative overflow-hidden bg-black">
           {viewOrder.map((view) => {
             if (!mountedViews.includes(view)) return null;
 

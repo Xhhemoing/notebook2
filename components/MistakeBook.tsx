@@ -1,14 +1,12 @@
 'use client';
 
 import { useAppContext } from '@/lib/store';
-import { BookX, Trash2, CheckCircle, Info, Edit, Search, Filter, X, ChevronLeft, ChevronRight, Zap, GitCommit, Play, Tag } from 'lucide-react';
+import { BookX, Trash2, CheckCircle, Info, Edit, Search, Filter, X, ChevronLeft, ChevronRight, GitCommit, Tag } from 'lucide-react';
 import { useState } from 'react';
 import { clsx } from 'clsx';
 import { ImageModal } from './ImageModal';
 import Markdown from 'react-markdown';
-import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import MistakeUploader from './MistakeUploader';
 import { v4 as uuidv4 } from 'uuid';
 import { createMemoryPayload } from '@/lib/data/commands';
 
@@ -25,9 +23,6 @@ export function MistakeBook() {
   const [editImageUrl, setEditImageUrl] = useState('');
 
   const [filterReason, setFilterReason] = useState<string>('all');
-  const [showUploader, setShowUploader] = useState(false);
-  const [examPrepData, setExamPrepData] = useState<string>('');
-  const [isGeneratingPrep, setIsGeneratingPrep] = useState(false);
 
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 12;
@@ -105,81 +100,6 @@ export function MistakeBook() {
     }
   };
 
-  const handleGenerateExamPrep = async () => {
-    setIsGeneratingPrep(true);
-    setExamPrepData('');
-    try {
-      // Pass actual mistakes to the API
-      const mistakesData = mistakes.map(m => ({
-        content: m.content,
-        wrongAnswer: m.wrongAnswer,
-        errorReason: m.errorReason,
-      }));
-      const response = await fetch('/api/exam-prep', { 
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mistakes: mistakesData })
-      });
-      if (!response.body) throw new Error('No response body');
-      
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-          if (line.startsWith('0:')) {
-            try {
-              const text = JSON.parse(line.substring(2));
-              setExamPrepData(prev => prev + text);
-            } catch (e) {}
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error generating exam prep:', error);
-      setExamPrepData('生成失败，请重试。');
-    } finally {
-      setIsGeneratingPrep(false);
-    }
-  };
-
-  const handleTaskComplete = (result: any) => {
-    if (!result) return;
-    
-    const memoryResult = createMemoryPayload({
-      id: uuidv4(),
-      subject: state.currentSubject,
-      content: result.originalQuestion || '未知题目',
-      wrongAnswer: result.studentAnswer || '',
-      errorReason: result.coreConcept ? `未掌握概念：${result.coreConcept}\n原因：${result.explanation}` : (result.explanation || ''),
-      isMistake: true,
-      functionType: '错题收录',
-      purposeType: '内化型',
-      knowledgeNodeIds: [],
-      confidence: 50,
-      mastery: 0,
-      createdAt: Date.now(),
-      sourceType: 'text' as 'text',
-      dataSource: 'mistake_analysis'
-    });
-
-    if (!memoryResult.ok) {
-      alert(`错题入库失败: ${memoryResult.error}`);
-      return;
-    }
-
-    const payload: any = memoryResult.value;
-    if (result.graphProposal) {
-      payload.draftProposal = result.graphProposal;
-    }
-
-    dispatch({ type: 'ADD_MEMORY', payload });
-  };
-  
   const handleApproveProposal = (memoryId: string, proposal: any) => {
     if (!proposal.suggestedNodeName) {
       dispatch({ type: 'REMOVE_DRAFT_PROPOSAL' as any, payload: memoryId });
@@ -223,36 +143,21 @@ export function MistakeBook() {
   };
 
   return (
-    <div className="p-6 h-full flex flex-col max-w-6xl mx-auto text-slate-200 bg-black">
+    <div className="p-4 md:p-6 h-full flex flex-col w-full max-w-[100vw] text-slate-200 bg-black overflow-hidden">
       {/* Header Section */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-6">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight flex items-center gap-3">
-            <div className="p-2 bg-red-500/10 rounded-lg">
-              <BookX className="w-6 h-6 text-red-500" />
+          <h2 className="text-xl md:text-2xl font-bold tracking-tight flex items-center gap-3">
+            <div className="p-2 bg-red-500/10 rounded-lg shrink-0">
+              <BookX className="w-5 h-5 md:w-6 md:h-6 text-red-500" />
             </div>
-            {state.currentSubject} 错题本
+            <span className="truncate">{state.currentSubject} 错题本</span>
           </h2>
-          <p className="text-slate-500 text-sm mt-1">记录薄弱环节，针对性查漏补缺</p>
+          <p className="text-slate-500 text-xs md:text-sm mt-1">记录薄弱环节，针对性查漏补缺</p>
         </div>
         
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={() => setShowUploader(!showUploader)}
-            className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-medium transition-colors"
-          >
-            {showUploader ? '隐藏意图上传录入' : '意图传题 (极速版)'}
-          </button>
-          <button
-            onClick={handleGenerateExamPrep}
-            disabled={isGeneratingPrep}
-            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium transition-colors flex items-center gap-2 disabled:opacity-50"
-          >
-            <Zap className="w-4 h-4" />
-            {isGeneratingPrep ? '生成中...' : '考前突击包'}
-          </button>
-          
-          <div className="relative group">
+        <div className="flex flex-wrap items-center gap-2 md:gap-3">
+          <div className="relative group flex-1 md:flex-initial">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 group-focus-within:text-red-500 transition-colors" />
             <input
               type="text"
@@ -263,11 +168,11 @@ export function MistakeBook() {
             />
           </div>
           
-          <div className="relative">
+          <div className="relative flex-1 md:flex-initial">
             <select
               value={filterReason}
               onChange={(e) => setFilterReason(e.target.value)}
-              className="appearance-none pl-10 pr-8 py-2 bg-slate-900 border border-slate-800 rounded-xl text-sm focus:ring-2 focus:ring-red-500/50 outline-none text-slate-300 cursor-pointer"
+              className="appearance-none pl-10 pr-8 py-2 bg-slate-900 border border-slate-800 rounded-xl text-sm focus:ring-2 focus:ring-red-500/50 outline-none text-slate-300 cursor-pointer w-full"
             >
               <option value="all">所有错因</option>
               {errorReasons.map(reason => (
@@ -279,56 +184,16 @@ export function MistakeBook() {
         </div>
       </div>
 
-      {showUploader && (
-        <div className="mb-8">
-          <MistakeUploader onTaskComplete={handleTaskComplete} />
-        </div>
-      )}
-
-      {examPrepData && (
-        <div className="mb-8 p-6 bg-indigo-900/20 border border-indigo-500/30 rounded-2xl relative">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-bold text-indigo-300 flex items-center gap-2">
-              <Zap className="w-5 h-5 text-indigo-400" />
-              考前突击包 (AI 生成试卷)
-            </h3>
-            <div className="flex items-center gap-2">
-              <button 
-                onClick={() => {
-                  const printContents = document.getElementById('exam-prep-content')?.innerHTML;
-                  if (printContents) {
-                    const originalContents = document.body.innerHTML;
-                    document.body.innerHTML = printContents;
-                    window.print();
-                    document.body.innerHTML = originalContents;
-                    window.location.reload(); // Reload to restore event listeners
-                  }
-                }}
-                className="px-3 py-1 bg-indigo-600/50 hover:bg-indigo-600 rounded-lg text-xs text-white"
-              >
-                打印 / 导出 PDF
-              </button>
-              <button onClick={() => setExamPrepData('')} className="text-slate-500 hover:text-slate-300">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-          </div>
-          <div id="exam-prep-content" className="prose prose-invert prose-sm max-w-none text-slate-300 bg-black p-4 rounded-xl">
-            <Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{examPrepData}</Markdown>
-          </div>
-        </div>
-      )}
-
       {/* Content Grid */}
       <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
         {paginatedMistakes.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 text-slate-600 border-2 border-dashed border-slate-900 rounded-3xl">
             <BookX className="w-12 h-12 mb-4 opacity-20" />
             <p className="text-lg font-medium">暂无错题记录</p>
-            <p className="text-sm opacity-60">使用上方的“意图传题”快速上传</p>
+            <p className="text-sm opacity-60 text-center px-4">在 AI 答疑中标记问题为“错题”即可在此查看</p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 pb-10">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 md:gap-6 pb-10">
             {paginatedMistakes.map((memory) => {
               const draftProposal = (memory as any).draftProposal; 
               

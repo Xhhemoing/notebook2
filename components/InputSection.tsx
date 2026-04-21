@@ -1218,13 +1218,13 @@ export function InputSection() {
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
         className={clsx(
-          'rounded-3xl border p-4 md:p-6 transition-all',
+          'rounded-3xl border p-2 md:p-4 transition-all w-full',
           isDragging ? 'border-indigo-500/40 bg-indigo-500/5' : 'border-slate-800 bg-slate-950'
         )}
       >
         <div className="space-y-4">
           <div className="space-y-4">
-            <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 md:p-6">
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-3 md:p-5">
               <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
                 <div>
                   <div className="text-sm font-semibold text-white">{activeMeta.label}</div>

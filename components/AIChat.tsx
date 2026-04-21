@@ -326,8 +326,8 @@ export function AIChat() {
   const memories = state.memories.filter(m => m.subject === state.currentSubject);
 
   return (
-    <div className="flex flex-col h-full max-w-5xl mx-auto p-4 text-slate-200">
-      <div className="flex-1 bg-slate-950 border border-slate-900 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+    <div className="flex flex-col h-full w-full p-0 sm:p-2 text-slate-200 overflow-hidden">
+      <div className="flex-1 bg-slate-950 border-x sm:border border-slate-900 sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden">
         {/* Chat Header */}
         <div className="px-5 py-3 border-b border-slate-900 bg-slate-950/50 backdrop-blur-md flex items-center justify-between">
           <div className="flex items-center gap-3">
