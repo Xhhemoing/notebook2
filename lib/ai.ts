@@ -19,14 +19,22 @@ import {
 let globalAiInstance: GoogleGenAI | null = null;
 function getGlobalAI() {
   if (!globalAiInstance) {
-    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      console.warn("NEXT_PUBLIC_GEMINI_API_KEY is not set. Gemini features will not work.");
+      console.warn("Gemini API key is not set. Gemini features will not work.");
       return null;
     }
     globalAiInstance = new GoogleGenAI({ apiKey });
   }
   return globalAiInstance;
+}
+
+function resolveOpenAIEmbeddingUrl(baseUrl: string | undefined) {
+  const target = baseUrl?.trim() || 'https://api.openai.com/v1';
+  const url = new URL(target);
+  const pathname = url.pathname.replace(/\/+$/, '');
+  url.pathname = pathname.endsWith('/embeddings') ? pathname : `${pathname}/embeddings`;
+  return url.toString();
 }
 
 /**
@@ -54,14 +62,21 @@ export async function getEmbedding(
     if (!textContent) {
       throw new Error('OpenAI embeddings only support text content');
     }
-    const response = await fetch('/api/ai/proxy', {
+    const response = await fetch(
+      typeof window === 'undefined' ? resolveOpenAIEmbeddingUrl(customModel.baseUrl) : '/api/ai/proxy',
+      {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...(typeof window === 'undefined' ? { Authorization: `Bearer ${customModel.apiKey}` } : {}),
       },
       body: JSON.stringify({
-        baseUrl: customModel.baseUrl,
-        apiKey: customModel.apiKey,
+        ...(typeof window === 'undefined'
+          ? {}
+          : {
+              baseUrl: customModel.baseUrl,
+              apiKey: customModel.apiKey,
+            }),
         model: customModel.modelId,
         input: textContent
       })

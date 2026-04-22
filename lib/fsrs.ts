@@ -1,7 +1,18 @@
 import { fsrs, Rating, Grade, Card, createEmptyCard } from 'ts-fsrs';
-import { FSRSData } from './types';
+import { FSRSData, FSRSProfile, Memory, ReviewEvent, ReviewMode } from './types';
 
 const f = fsrs();
+
+function getScheduler(profile?: FSRSProfile) {
+  if (!profile || profile.status !== 'optimized') {
+    return f;
+  }
+
+  return fsrs({
+    w: profile.parameters,
+    request_retention: profile.desiredRetention || profile.recommendedRetention || 0.9,
+  });
+}
 
 export function getInitialFSRSData(): FSRSData {
   const card = createEmptyCard();
@@ -18,7 +29,12 @@ export function getInitialFSRSData(): FSRSData {
   };
 }
 
-export function reviewCard(fsrsData: FSRSData | undefined, grade: Grade, now: Date = new Date()): FSRSData {
+export function reviewCard(
+  fsrsData: FSRSData | undefined,
+  grade: Grade,
+  now: Date = new Date(),
+  profile?: FSRSProfile
+): FSRSData {
   let card: Card;
   if (!fsrsData) {
     card = createEmptyCard();
@@ -33,11 +49,11 @@ export function reviewCard(fsrsData: FSRSData | undefined, grade: Grade, now: Da
       reps: fsrsData.reps,
       lapses: fsrsData.lapses,
       state: fsrsData.state,
-      last_review: new Date() // approximate
+      last_review: new Date(now.getTime() - Math.max(0, fsrsData.elapsed_days || 0) * 86400000)
     };
   }
 
-  const scheduling_cards = f.repeat(card, now);
+  const scheduling_cards = getScheduler(profile).repeat(card, now);
   const nextCard = scheduling_cards[grade].card;
 
   return {
@@ -53,7 +69,12 @@ export function reviewCard(fsrsData: FSRSData | undefined, grade: Grade, now: Da
   };
 }
 
-export function calculateMetrics(fsrsData: FSRSData | undefined, lastReviewed?: number, now: Date = new Date()): { confidence: number, mastery: number } {
+export function calculateMetrics(
+  fsrsData: FSRSData | undefined,
+  lastReviewed?: number,
+  now: Date = new Date(),
+  profile?: FSRSProfile
+): { confidence: number, mastery: number } {
   if (!fsrsData) {
     return { confidence: 0, mastery: 0 };
   }
@@ -77,7 +98,7 @@ export function calculateMetrics(fsrsData: FSRSData | undefined, lastReviewed?: 
     retrievability = 0;
   } else if (card.last_review) {
     try {
-      const r = f.get_retrievability(card, now) as any;
+      const r = getScheduler(profile).get_retrievability(card, now) as any;
       retrievability = typeof r === 'number' ? r : parseFloat(r) / 100;
     } catch (e) {
       retrievability = 0;
@@ -92,6 +113,36 @@ export function calculateMetrics(fsrsData: FSRSData | undefined, lastReviewed?: 
   const mastery = Math.max(0, Math.min(100, Math.round((Math.log10(card.stability + 1) / Math.log10(365 + 1)) * 100)));
 
   return { confidence, mastery };
+}
+
+export function createReviewEvent(params: {
+  memory: Memory;
+  rating: Grade;
+  reviewedAt: number;
+  previousFsrs?: FSRSData;
+  nextFsrs: FSRSData;
+  mode: ReviewMode;
+}): ReviewEvent {
+  const { memory, rating, reviewedAt, previousFsrs, nextFsrs, mode } = params;
+  const lastReviewedAt = memory.lastReviewed || memory.createdAt;
+  const elapsedDays = Math.max(0, Math.floor((reviewedAt - lastReviewedAt) / 86400000));
+
+  return {
+    id: crypto.randomUUID(),
+    memoryId: memory.id,
+    subject: memory.subject,
+    rating: rating as 1 | 2 | 3 | 4,
+    reviewedAt,
+    elapsedDays,
+    scheduledDays: previousFsrs?.scheduled_days || 0,
+    previousState: previousFsrs?.state,
+    nextState: nextFsrs.state,
+    stabilityBefore: previousFsrs?.stability,
+    stabilityAfter: nextFsrs.stability,
+    difficultyBefore: previousFsrs?.difficulty,
+    difficultyAfter: nextFsrs.difficulty,
+    mode,
+  };
 }
 
 export { Rating };

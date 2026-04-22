@@ -1,12 +1,13 @@
 'use client';
 
 import React, { createContext, useContext, useReducer, useEffect, useState, useRef } from 'react';
-import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict } from './types';
+import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict, ReviewEvent, FSRSProfile, RetrievalIndexState } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { deleteDB, openDB } from 'idb';
 import { evaluateMemoryQuality, MEMORY_QUALITY_RULE_VERSION, normalizeKnowledgeNodes } from './data/quality';
 import { applyDataRetention, normalizeResourceRetention } from './feedback';
 import { normalizeInputHistoryItems, normalizeInputHistoryItem } from './input-history';
+import { syncRetrievalIndex } from './retrieval/client';
 
 const DB_NAME = 'gaokao-ai-db';
 const STORE_NAME = 'app-state';
@@ -126,6 +127,8 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
         if (data) {
           const remoteMemories = Array.isArray(data.memories) ? data.memories : [];
           const remoteNodes = Array.isArray(data.knowledgeNodes) ? data.knowledgeNodes : [];
+          const remoteReviewEvents = Array.isArray(data.reviewEvents) ? data.reviewEvents : [];
+          const remoteFSRSProfiles = Array.isArray(data.fsrsProfiles) ? data.fsrsProfiles : [];
           const localMemoryById = new Map(state.memories.map((memory) => [memory.id, memory]));
           const nonConflictMemories: Memory[] = [];
           const conflicts: SyncMemoryConflict[] = [];
@@ -167,6 +170,12 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
           if (remoteNodes.length > 0) {
             dispatch({ type: 'BATCH_UPSERT_NODES_FROM_SYNC', payload: remoteNodes });
           }
+          if (remoteReviewEvents.length > 0) {
+            dispatch({ type: 'BATCH_UPSERT_REVIEW_EVENTS_FROM_SYNC', payload: remoteReviewEvents });
+          }
+          if (remoteFSRSProfiles.length > 0) {
+            dispatch({ type: 'BATCH_UPSERT_FSRS_PROFILES_FROM_SYNC', payload: remoteFSRSProfiles });
+          }
           if (conflicts.length > 0) {
             dispatch({ type: 'UPSERT_SYNC_CONFLICTS', payload: conflicts });
           }
@@ -198,6 +207,26 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
         body: JSON.stringify({ action: 'push_nodes', payload: pushNodes })
       });
       if (!pushRes.ok) console.warn('D1 Sync Push Nodes failed:', pushRes.status);
+    }
+
+    const pushReviewEvents = (state.reviewEvents || []).filter(event => (event.reviewedAt || 0) > (state.lastSynced || 0));
+    if (pushReviewEvents.length > 0) {
+      const pushRes = await fetch('/api/sync', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action: 'push_review_events', payload: pushReviewEvents })
+      });
+      if (!pushRes.ok) console.warn('D1 Sync Push Review Events failed:', pushRes.status);
+    }
+
+    const pushFSRSProfiles = (state.fsrsProfiles || []).filter(profile => (profile.optimizedAt || 0) > (state.lastSynced || 0));
+    if (pushFSRSProfiles.length > 0) {
+      const pushRes = await fetch('/api/sync', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action: 'push_fsrs_profiles', payload: pushFSRSProfiles })
+      });
+      if (!pushRes.ok) console.warn('D1 Sync Push FSRS Profiles failed:', pushRes.status);
     }
 
   } catch (e) {
@@ -296,6 +325,41 @@ function normalizeNodeForSync(node: KnowledgeNode): KnowledgeNode {
     status: node.status || 'active',
     dataSource: node.dataSource || 'manual',
     updatedAt: node.updatedAt || Date.now(),
+  };
+}
+
+function normalizeReviewEventForSync(event: ReviewEvent): ReviewEvent {
+  return {
+    ...event,
+    reviewedAt: event.reviewedAt || Date.now(),
+    elapsedDays: Number(event.elapsedDays || 0),
+    scheduledDays: Number(event.scheduledDays || 0),
+  };
+}
+
+function normalizeFSRSProfileForSync(profile: FSRSProfile): FSRSProfile {
+  return {
+    ...profile,
+    id: profile.id || `fsrs:${profile.subject}`,
+    parameters: Array.isArray(profile.parameters) ? profile.parameters : [],
+    desiredRetention: profile.desiredRetention || 0.9,
+    recommendedRetention: profile.recommendedRetention || profile.desiredRetention || 0.9,
+    cmrrLowerBound: profile.cmrrLowerBound || 0.9,
+    eventCount: profile.eventCount || 0,
+    distinctMemoryCount: profile.distinctMemoryCount || 0,
+    status: profile.status || 'collecting',
+  };
+}
+
+function normalizeRetrievalIndexState(state?: Partial<RetrievalIndexState>): RetrievalIndexState {
+  return {
+    backend: state?.backend || 'server-qdrant',
+    status: state?.status || 'dirty',
+    dirty: state?.dirty ?? true,
+    pendingDocumentCount: state?.pendingDocumentCount || 0,
+    lastIndexedAt: state?.lastIndexedAt,
+    lastAttemptAt: state?.lastAttemptAt,
+    lastError: state?.lastError,
   };
 }
 
@@ -562,11 +626,20 @@ const baseInitialState: AppState = {
     exportOptimizationIncludeImages: true,
     minReviewDifficulty: 0,
     maxReviewDifficulty: 10,
+    serverBackend: 'server-qdrant',
+    fusionMode: 'dbsf',
+    recallTopK: 40,
+    rerankTopN: 10,
+    rerankMode: 'cross-encoder',
+    fsrsDesiredRetention: 0.9,
     syncInterval: 300, // 5 minutes
     enableAutoSync: true,
   },
   logs: [],
   feedbackEvents: [],
+  reviewEvents: [],
+  fsrsProfiles: [],
+  retrievalIndex: normalizeRetrievalIndexState(),
   inputHistory: [],
   resources: [],
   syncConflicts: [],
@@ -721,6 +794,46 @@ function reducer(state: AppState, action: Action): AppState {
       };
     case 'DELETE_REVIEW_PLAN':
       return { ...state, reviewPlans: state.reviewPlans.filter(p => p.id !== action.payload) };
+    case 'ADD_REVIEW_EVENT':
+      if ((state.reviewEvents || []).some((event) => event.id === action.payload.id)) return state;
+      return finalizeState({
+        ...state,
+        reviewEvents: [normalizeReviewEventForSync(action.payload), ...(state.reviewEvents || [])].slice(0, 20000),
+      });
+    case 'BATCH_UPSERT_REVIEW_EVENTS_FROM_SYNC':
+      const reviewEventMap = new Map((state.reviewEvents || []).map((event) => [event.id, event]));
+      action.payload.forEach((event) => {
+        reviewEventMap.set(event.id, normalizeReviewEventForSync(event));
+      });
+      return finalizeState({
+        ...state,
+        reviewEvents: Array.from(reviewEventMap.values()).sort((left, right) => right.reviewedAt - left.reviewedAt),
+      });
+    case 'UPSERT_FSRS_PROFILE':
+      return finalizeState({
+        ...state,
+        fsrsProfiles: [
+          normalizeFSRSProfileForSync(action.payload),
+          ...(state.fsrsProfiles || []).filter((profile) => profile.subject !== action.payload.subject),
+        ],
+      });
+    case 'BATCH_UPSERT_FSRS_PROFILES_FROM_SYNC':
+      const profileMap = new Map((state.fsrsProfiles || []).map((profile) => [profile.subject, profile]));
+      action.payload.forEach((profile) => {
+        profileMap.set(profile.subject, normalizeFSRSProfileForSync(profile));
+      });
+      return finalizeState({
+        ...state,
+        fsrsProfiles: Array.from(profileMap.values()),
+      });
+    case 'SET_RETRIEVAL_INDEX_STATE':
+      return {
+        ...state,
+        retrievalIndex: normalizeRetrievalIndexState({
+          ...(state.retrievalIndex || {}),
+          ...action.payload,
+        }),
+      };
     case 'UPDATE_SETTINGS':
       return finalizeState({ ...state, settings: { ...state.settings, ...action.payload } });
     case 'SET_CORRELATIONS':
@@ -801,6 +914,9 @@ function reducer(state: AppState, action: Action): AppState {
         settings: { ...initialState.settings, ...(action.payload.settings || {}) }, 
         logs: action.payload.logs || [],
         feedbackEvents: action.payload.feedbackEvents || [],
+        reviewEvents: (action.payload.reviewEvents || []).map(normalizeReviewEventForSync),
+        fsrsProfiles: (action.payload.fsrsProfiles || []).map(normalizeFSRSProfileForSync),
+        retrievalIndex: normalizeRetrievalIndexState(action.payload.retrievalIndex),
         textbooks: action.payload.textbooks || [],
         reviewPlans: action.payload.reviewPlans || [],
         inputHistory: normalizeInputHistoryItems(
@@ -1018,6 +1134,23 @@ const AppContext = createContext<{
   dispatch: React.Dispatch<Action>;
 } | null>(null);
 
+function buildRetrievalSourceSignature(state: AppState) {
+  const memorySignature = state.memories
+    .map((memory) => `${memory.id}:${memory.updatedAt || memory.createdAt}:${memory.status || 'active'}`)
+    .sort()
+    .join('|');
+  const textbookSignature = state.textbooks
+    .map((textbook) => `${textbook.id}:${textbook.updatedAt || textbook.createdAt}:${textbook.pages.length}`)
+    .sort()
+    .join('|');
+  const resourceSignature = state.resources
+    .map((resource) => `${resource.id}:${resource.updatedAt || resource.createdAt}:${resource.status || 'active'}`)
+    .sort()
+    .join('|');
+
+  return `${state.settings.syncKey || ''}::${memorySignature}::${textbookSignature}::${resourceSignature}`;
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [isMounted, setIsMounted] = useState(false);
@@ -1059,9 +1192,89 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [state, isMounted]);
 
   const stateRef = useRef(state);
+  const retrievalSourceSignatureRef = useRef('');
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  useEffect(() => {
+    if (!isMounted) return;
+    const signature = buildRetrievalSourceSignature(state);
+    if (!retrievalSourceSignatureRef.current) {
+      retrievalSourceSignatureRef.current = signature;
+      return;
+    }
+    if (retrievalSourceSignatureRef.current !== signature) {
+      retrievalSourceSignatureRef.current = signature;
+      dispatch({
+        type: 'SET_RETRIEVAL_INDEX_STATE',
+        payload: {
+          status: 'dirty',
+          dirty: true,
+          pendingDocumentCount: state.memories.length + state.textbooks.reduce((sum, textbook) => sum + textbook.pages.length, 0) + state.resources.length,
+          lastError: undefined,
+        },
+      });
+    }
+  }, [isMounted, state.memories, state.textbooks, state.resources, state.settings.syncKey]);
+
+  useEffect(() => {
+    if (!isMounted) return;
+    if (state.settings.serverBackend !== 'server-qdrant') return;
+    if (!state.retrievalIndex.dirty || state.retrievalIndex.status === 'syncing') return;
+
+    const syncKey = state.settings.syncKey?.trim();
+    if (!syncKey || syncKey.length < 4) return;
+
+    const timeoutId = setTimeout(() => {
+      const current = stateRef.current;
+      dispatch({
+        type: 'SET_RETRIEVAL_INDEX_STATE',
+        payload: { status: 'syncing', dirty: true, lastAttemptAt: Date.now(), lastError: undefined },
+      });
+
+      syncRetrievalIndex({
+        syncKey,
+        memories: current.memories,
+        textbooks: current.textbooks,
+        resources: current.resources,
+        settings: current.settings,
+      })
+        .then((result) => {
+          dispatch({
+            type: 'SET_RETRIEVAL_INDEX_STATE',
+            payload: {
+              status: 'ready',
+              dirty: false,
+              pendingDocumentCount: Number(result?.indexed || 0),
+              lastIndexedAt: Number(result?.indexedAt || Date.now()),
+              lastError: undefined,
+            },
+          });
+        })
+        .catch((error) => {
+          dispatch({
+            type: 'SET_RETRIEVAL_INDEX_STATE',
+            payload: {
+              status: 'error',
+              dirty: true,
+              lastError: error?.message || 'retrieval indexing failed',
+            },
+          });
+        });
+    }, 1500);
+
+    return () => clearTimeout(timeoutId);
+  }, [
+    isMounted,
+    state.retrievalIndex.dirty,
+    state.retrievalIndex.status,
+    state.settings.serverBackend,
+    state.settings.syncKey,
+    state.memories,
+    state.textbooks,
+    state.resources,
+  ]);
 
   useEffect(() => {
     if (isMounted && state.settings.enableAutoSync && state.settings.syncInterval > 0) {
