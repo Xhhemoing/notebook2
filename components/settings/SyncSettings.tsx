@@ -302,20 +302,26 @@ export default function SyncSettings() {
                       <textarea
                         value={mergeDraft.content}
                         onChange={(e) =>
-                          setMergeDrafts((prev) => ({
-                            ...prev,
-                            [conflict.memoryId]: { ...prev[conflict.memoryId], content: e.target.value },
-                          }))
+                          setMergeDrafts((prev) => {
+                            const current = prev[conflict.memoryId] || { content: '', notes: '', correctAnswer: '', errorReason: '' };
+                            return {
+                              ...prev,
+                              [conflict.memoryId]: { ...current, content: e.target.value },
+                            };
+                          })
                         }
                         className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200"
                       />
                       <textarea
                         value={mergeDraft.notes}
                         onChange={(e) =>
-                          setMergeDrafts((prev) => ({
-                            ...prev,
-                            [conflict.memoryId]: { ...prev[conflict.memoryId], notes: e.target.value },
-                          }))
+                          setMergeDrafts((prev) => {
+                            const current = prev[conflict.memoryId] || { content: '', notes: '', correctAnswer: '', errorReason: '' };
+                            return {
+                              ...prev,
+                              [conflict.memoryId]: { ...current, notes: e.target.value },
+                            };
+                          })
                         }
                         placeholder="可选：合并后的补充笔记"
                         className="w-full h-20 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200"

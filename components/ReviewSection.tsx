@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useAppContext } from '@/lib/store';
 import { generateQuizzes, QuizQuestion } from '@/lib/ai';
 import { Memory } from '@/lib/types';
-import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen, Download } from 'lucide-react';
+import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen, Download, CalendarDays, Target } from 'lucide-react';
 import { clsx } from 'clsx';
 import { reviewCard, Rating, Grade, calculateMetrics } from '@/lib/fsrs';
 import Markdown from 'react-markdown';
@@ -42,6 +42,39 @@ export function ReviewSection() {
       // Then sort by confidence (lower confidence first)
       return aMetrics.confidence - bMetrics.confidence;
     });
+
+  const weeklyDashboard = useMemo(() => {
+    const currentSubjectMemories = state.memories.filter((memory) => memory.subject === state.currentSubject);
+    const subjectMistakes = currentSubjectMemories.filter((memory) => memory.isMistake);
+    const weakNodeCount = new Map<string, number>();
+    subjectMistakes.forEach((memory) => {
+      memory.knowledgeNodeIds.forEach((nodeId) => {
+        weakNodeCount.set(nodeId, (weakNodeCount.get(nodeId) || 0) + 1);
+      });
+    });
+
+    const weakNodes = Array.from(weakNodeCount.entries())
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 7)
+      .map(([nodeId, count]) => ({
+        nodeId,
+        count,
+        nodeName: state.knowledgeNodes.find((node) => node.id === nodeId)?.name || '未命名节点',
+      }));
+
+    const dueCount = currentSubjectMemories.filter((memory) => (memory.fsrs?.due || 0) <= Date.now()).length;
+    const days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
+    return days.map((day, index) => {
+      const focus = weakNodes[index % Math.max(weakNodes.length, 1)];
+      return {
+        day,
+        focusName: focus?.nodeName || `${state.currentSubject}基础巩固`,
+        focusCount: focus?.count || 0,
+        recommendedTasks: Math.max(2, Math.min(8, Math.round((dueCount || 3) / 4))),
+      };
+    });
+  }, [state.memories, state.knowledgeNodes, state.currentSubject]);
 
   const startReview = async () => {
     if (memoriesToReview.length === 0) return;
@@ -286,6 +319,26 @@ export function ReviewSection() {
                 )}
               />
             </button>
+          </div>
+        </div>
+
+        <div className="w-full mb-8 p-5 bg-slate-900/30 border border-slate-800 rounded-2xl text-left">
+          <div className="flex items-center gap-2 mb-4">
+            <CalendarDays className="w-4 h-4 text-indigo-400" />
+            <h3 className="text-sm font-semibold text-slate-200">本周复习计划看板（自动生成）</h3>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-7 gap-2">
+            {weeklyDashboard.map((item) => (
+              <div key={item.day} className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
+                <div className="text-[11px] text-indigo-300 font-semibold mb-1">{item.day}</div>
+                <div className="text-xs text-slate-300 line-clamp-2 min-h-[32px]">{item.focusName}</div>
+                <div className="mt-2 text-[10px] text-slate-500 flex items-center gap-1">
+                  <Target className="w-3 h-3" />
+                  薄弱命中 {item.focusCount}
+                </div>
+                <div className="text-[10px] text-emerald-400 mt-1">建议任务 {item.recommendedTasks} 题</div>
+              </div>
+            ))}
           </div>
         </div>
         <button

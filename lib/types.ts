@@ -3,6 +3,8 @@ export type Subject = string;
 export type MemoryFunction = string;
 export type MemoryPurpose = string;
 export type IngestionMode = 'quick' | 'image_pro' | 'exam';
+export type ReviewGrade = 1 | 2 | 3 | 4;
+export type ReviewMode = 'standard' | 'instant' | 'joint' | 'manual';
 export type ResourceOrigin =
   | 'manual'
   | 'input_upload'
@@ -111,6 +113,100 @@ export interface CustomProvider {
   models: { id: string; name: string, isFavorite?: boolean }[];
 }
 
+export type RetrievalBackend = 'server-qdrant' | 'local-browser';
+export type RetrievalFusionMode = 'dbsf' | 'rrf';
+export type RetrievalRerankMode = 'cross-encoder' | 'late-interaction' | 'hybrid-only';
+export type RetrievalDocumentKind = 'memory' | 'textbook_page' | 'resource_excerpt';
+export type RetrievalProviderKind = 'openai' | 'http-json';
+
+export interface RetrievalProviderConfig {
+  enabled?: boolean;
+  name?: string;
+  provider: RetrievalProviderKind;
+  url?: string;
+  apiKey?: string;
+  model?: string;
+}
+
+export interface RetrievalDocument {
+  id: string;
+  syncKey: string;
+  kind: RetrievalDocumentKind;
+  sourceId: string;
+  chunkIndex: number;
+  chunkCount?: number;
+  title?: string;
+  subject: Subject;
+  text: string;
+  nodeIds: string[];
+  isMistake?: boolean;
+  sourceResourceIds?: string[];
+  sourceTextbookId?: string;
+  sourceTextbookPage?: number;
+  updatedAt: number;
+  dense?: number[];
+  sparse?: Record<string, number>;
+  metadata: Record<string, unknown>;
+}
+
+export interface RetrievalScoreBreakdown {
+  dense?: number;
+  sparse?: number;
+  fusion?: number;
+  rerank?: number;
+  lateInteraction?: number;
+  final: number;
+}
+
+export interface RetrievalHit {
+  id: string;
+  document: RetrievalDocument;
+  score: number;
+  scoreBreakdown: RetrievalScoreBreakdown;
+  matchReasons: string[];
+}
+
+export interface RetrievalIndexState {
+  backend: RetrievalBackend;
+  status: 'idle' | 'dirty' | 'syncing' | 'ready' | 'error';
+  dirty: boolean;
+  pendingDocumentCount: number;
+  lastIndexedAt?: number;
+  lastAttemptAt?: number;
+  lastError?: string;
+}
+
+export interface ReviewEvent {
+  id: string;
+  memoryId: string;
+  subject: Subject;
+  rating: ReviewGrade;
+  reviewedAt: number;
+  elapsedDays: number;
+  scheduledDays: number;
+  previousState?: number;
+  nextState?: number;
+  stabilityBefore?: number;
+  stabilityAfter?: number;
+  difficultyBefore?: number;
+  difficultyAfter?: number;
+  mode: ReviewMode;
+}
+
+export interface FSRSProfile {
+  id: string;
+  subject: Subject;
+  parameters: number[];
+  desiredRetention: number;
+  recommendedRetention: number;
+  cmrrLowerBound: number;
+  optimizedAt?: number;
+  eventCount: number;
+  distinctMemoryCount: number;
+  status: 'collecting' | 'optimized' | 'temporary' | 'error';
+  notes?: string;
+}
+
 export interface CustomModel {
   id: string;
   name: string;
@@ -149,6 +245,14 @@ export interface Settings {
   fsrsUpdateFrequency?: string;
   customModels?: CustomModel[]; // Legacy
   customProviders?: CustomProvider[];
+  serverBackend?: RetrievalBackend;
+  fusionMode?: RetrievalFusionMode;
+  recallTopK?: number;
+  rerankTopN?: number;
+  rerankMode?: RetrievalRerankMode;
+  rerankerProvider?: RetrievalProviderConfig;
+  lateInteractionProvider?: RetrievalProviderConfig;
+  fsrsDesiredRetention?: number;
   syncInterval: number; // in seconds, 0 means manual only
   enableAutoSync: boolean;
 }
@@ -295,6 +399,9 @@ export interface AppState {
   links: Link[];
   textbooks: Textbook[];
   reviewPlans: ReviewPlan[];
+  reviewEvents: ReviewEvent[];
+  fsrsProfiles: FSRSProfile[];
+  retrievalIndex: RetrievalIndexState;
   settings: Settings;
   lastSynced?: number;
   logs: AILog[];
@@ -327,6 +434,11 @@ export type Action =
   | { type: 'ADD_REVIEW_PLAN'; payload: ReviewPlan }
   | { type: 'UPDATE_REVIEW_PLAN'; payload: ReviewPlan }
   | { type: 'DELETE_REVIEW_PLAN'; payload: string }
+  | { type: 'ADD_REVIEW_EVENT'; payload: ReviewEvent }
+  | { type: 'BATCH_UPSERT_REVIEW_EVENTS_FROM_SYNC'; payload: ReviewEvent[] }
+  | { type: 'UPSERT_FSRS_PROFILE'; payload: FSRSProfile }
+  | { type: 'BATCH_UPSERT_FSRS_PROFILES_FROM_SYNC'; payload: FSRSProfile[] }
+  | { type: 'SET_RETRIEVAL_INDEX_STATE'; payload: Partial<RetrievalIndexState> }
   | { type: 'UPDATE_SETTINGS'; payload: Partial<Settings> }
   | { type: 'SET_CORRELATIONS'; payload: KnowledgeNode[] }
   | { type: 'SET_LAST_SYNCED'; payload: number }
@@ -351,6 +463,7 @@ export type Action =
   | { type: 'DELETE_SUBJECT_TEXTBOOKS'; payload: { subject: Subject } }
   | { type: 'UPDATE_DRAFT'; payload: { draftInput?: string; draftImages?: string[]; draftGraphProposal?: { reasoning: string; operations: any[] } | null; } }
   | { type: 'ADD_RESOURCE'; payload: Resource }
+  | { type: 'BATCH_ADD_RESOURCES'; payload: Resource[] }
   | { type: 'UPDATE_RESOURCE'; payload: Resource }
   | { type: 'DELETE_RESOURCE'; payload: string }
   | { type: 'BATCH_DELETE_RESOURCES'; payload: string[] }

@@ -743,10 +743,22 @@ function reducer(state: AppState, action: Action): AppState {
       if (!conflict) return state;
 
       if (action.payload.strategy === 'keep_local') {
-        return {
+        const keepLocalMap = new Map(state.memories.map((memory) => [memory.id, memory]));
+        const localMemory = keepLocalMap.get(action.payload.memoryId);
+        if (localMemory) {
+          keepLocalMap.set(action.payload.memoryId, {
+            ...localMemory,
+            updatedAt: Date.now(),
+            version: (localMemory.version || 1) + 1,
+          });
+        }
+        return finalizeState({
           ...state,
+          memories: Array.from(keepLocalMap.values()).sort(
+            (left, right) => (right.updatedAt || right.createdAt || 0) - (left.updatedAt || left.createdAt || 0)
+          ),
           syncConflicts: state.syncConflicts.filter((item) => item.memoryId !== action.payload.memoryId),
-        };
+        });
       }
 
       if (action.payload.strategy === 'use_remote') {
@@ -904,6 +916,20 @@ function reducer(state: AppState, action: Action): AppState {
           dataSource: action.payload.dataSource || 'manual',
           updatedAt: action.payload.updatedAt || Date.now()
         }, ...state.resources]
+      });
+    case 'BATCH_ADD_RESOURCES':
+      return finalizeState({
+        ...state,
+        resources: [
+          ...action.payload.map((resource) => ({
+            ...resource,
+            version: resource.version || 1,
+            status: resource.status || 'active',
+            dataSource: resource.dataSource || 'manual',
+            updatedAt: resource.updatedAt || Date.now(),
+          })),
+          ...state.resources,
+        ],
       });
     case 'UPDATE_RESOURCE':
       return finalizeState({

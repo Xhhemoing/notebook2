@@ -1,22 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
   BrainCircuit,
   Check,
   CheckCircle2,
-  FileImage,
-  FileText,
   Gauge,
   History,
-  Info,
   KeyRound,
   Layers3,
   Loader2,
-  Network,
-  RotateCw,
   ScanLine,
   Sparkles,
   Trash2,
@@ -527,6 +522,9 @@ export function InputSection() {
   const [explicitPurpose, setExplicitPurpose] = useState<string>('auto');
   const [markAsMistake, setMarkAsMistake] = useState(false);
   const [annotatorAssetId, setAnnotatorAssetId] = useState<string | null>(null);
+  const [isDragOverUpload, setIsDragOverUpload] = useState(false);
+  const [isUploadingAssets, setIsUploadingAssets] = useState(false);
+  const [isPendingAssetTransition, startAssetTransition] = useTransition();
   const [imageOptions, setImageOptions] = useState({
     enhanceImage: true,
     preserveAnnotations: true,
@@ -549,17 +547,85 @@ export function InputSection() {
     setInput((prev) => (prev.trim() ? prev : template.seedInput));
   }, []);
 
+  const processFiles = useCallback(async (rawFiles: File[]) => {
+    const files = rawFiles.filter((file) => {
+      if (file.type.startsWith('image/')) return true;
+      if (file.type === 'application/pdf') return true;
+      if (file.type === 'text/plain') return true;
+      return file.name.toLowerCase().endsWith('.txt') || file.name.toLowerCase().endsWith('.pdf');
+    });
+    if (files.length === 0) return;
+
+    setIsUploadingAssets(true);
+    try {
+      const now = Date.now();
+      const processed = await Promise.all(
+        files.map(async (file) => {
+          const preview = await readAsDataUrl(file);
+          const resourceId = uuidv4();
+          const resourcePayload = {
+            id: resourceId,
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            createdAt: now,
+            updatedAt: now,
+            data: preview,
+            subject: state.currentSubject,
+            origin: 'input_upload' as const,
+            retentionPolicy: 'auto' as const,
+            expiresAt: getAutoExpireAt(21),
+            tags: [workflow],
+            isFolder: false,
+            parentId: null,
+          };
+          const draftAsset: DraftAsset = {
+            resourceId,
+            name: file.name,
+            preview,
+            type: file.type,
+            size: file.size,
+          };
+          return { resourcePayload, draftAsset };
+        })
+      );
+
+      dispatch({ type: 'BATCH_ADD_RESOURCES', payload: processed.map((item) => item.resourcePayload) });
+      startAssetTransition(() => {
+        setDraftAssets((prev) => [...prev, ...processed.map((item) => item.draftAsset)]);
+      });
+    } finally {
+      setIsUploadingAssets(false);
+    }
+  }, [dispatch, state.currentSubject, workflow]);
+
   const handleFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     if (!event.target.files) return;
-    for (const file of Array.from(event.target.files)) {
-      let preview = await readAsDataUrl(file);
-      if (file.type.startsWith('image/') && imageOptions.enhanceImage) preview = await enhanceDocumentImage(preview);
-      const resourceId = uuidv4();
-      dispatch({ type: 'ADD_RESOURCE', payload: { id: resourceId, name: file.name, type: file.type, size: file.size, createdAt: Date.now(), updatedAt: Date.now(), data: preview, subject: state.currentSubject, origin: 'input_upload', retentionPolicy: 'auto', expiresAt: getAutoExpireAt(21), tags: [workflow], isFolder: false, parentId: null } });
-      setDraftAssets(prev => [...prev, { resourceId, name: file.name, preview, type: file.type, size: file.size }]);
-    }
+    await processFiles(Array.from(event.target.files));
     event.target.value = '';
-  }, [dispatch, imageOptions.enhanceImage, state.currentSubject, workflow]);
+  }, [processFiles]);
+
+  const handleUploadDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragOverUpload(true);
+  }, []);
+
+  const handleUploadDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragOverUpload(false);
+  }, []);
+
+  const handleUploadDrop = useCallback(async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragOverUpload(false);
+    const files = Array.from(event.dataTransfer?.files || []);
+    if (files.length > 0) {
+      await processFiles(files);
+    }
+  }, [processFiles]);
 
   const handleAnalyze = useCallback(() => {
     if (!input.trim() && draftAssets.length === 0) return;
@@ -610,6 +676,17 @@ export function InputSection() {
     setManualHighlights([]);
 
     (async () => {
+      const parseAssets = imageOptions.enhanceImage
+        ? await Promise.all(
+            snapshots.assets.map(async (asset) => {
+              if (asset.startsWith('data:image/')) {
+                return enhanceDocumentImage(asset);
+              }
+              return asset;
+            })
+          )
+        : snapshots.assets;
+
       let attempt = 0;
       while (attempt <= maxAutoRetries) {
         try {
@@ -631,7 +708,7 @@ export function InputSection() {
             snapshots.subject, 
             snapshots.knowledgeNodes, 
             snapshots.settings, 
-            snapshots.assets, 
+            parseAssets, 
             snapshots.expFunc !== 'auto' ? snapshots.expFunc : undefined, 
             snapshots.expPurp !== 'auto' ? snapshots.expPurp : undefined, 
             undefined, 
@@ -646,7 +723,7 @@ export function InputSection() {
             subject: snapshots.subject, 
             workflow: snapshots.workflow, 
             input: snapshots.input, 
-            images: snapshots.assets, 
+            images: parseAssets, 
             imageResourceIds: snapshots.imgResourceIds, 
             supplementaryInstruction: snapshots.supp, 
             parsedItems: result.parsedItems, 
@@ -854,9 +931,37 @@ export function InputSection() {
                 </div>
               </div>
 
-              <div className="relative bg-slate-900/30 border border-slate-800 rounded-2xl p-2 focus-within:border-indigo-500/50 transition-all">
+              <div
+                onDragOver={handleUploadDragOver}
+                onDragLeave={handleUploadDragLeave}
+                onDrop={handleUploadDrop}
+                className={clsx(
+                  "relative bg-slate-900/30 border rounded-2xl p-2 transition-all",
+                  isDragOverUpload
+                    ? "border-indigo-500 bg-indigo-500/5 ring-2 ring-indigo-500/30"
+                    : "border-slate-800 focus-within:border-indigo-500/50"
+                )}
+              >
+                {isDragOverUpload && (
+                  <div className="absolute inset-0 z-10 rounded-2xl border-2 border-dashed border-indigo-400/60 bg-indigo-500/10 flex items-center justify-center pointer-events-none">
+                    <div className="text-xs font-bold text-indigo-200">松开鼠标即可上传文件</div>
+                  </div>
+                )}
                 <textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="在此输入文本内容，或上传素材辅助解析..." className="w-full bg-transparent p-2 text-sm text-slate-200 placeholder-slate-600 focus:outline-none min-h-[160px] md:min-h-[220px] resize-none" />
-                <div className="flex items-center justify-between px-2 pb-2"><div className="flex gap-4"><button onClick={() => fileInputRef.current?.click()} className="p-1 text-slate-500 hover:text-indigo-400 transition-colors flex items-center gap-2"><UploadCloud className="w-4 h-4" /><span className="text-[10px] font-bold uppercase tracking-widest">上传素材</span></button></div><input ref={fileInputRef} type="file" className="hidden" multiple accept="image/*,.pdf,.txt" onChange={handleFileUpload} /><div className="text-[10px] font-bold text-slate-600 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">智能录入模式</div></div>
+                <div className="flex items-center justify-between px-2 pb-2">
+                  <div className="flex gap-4 items-center">
+                    <button onClick={() => fileInputRef.current?.click()} className="p-1 text-slate-500 hover:text-indigo-400 transition-colors flex items-center gap-2">
+                      <UploadCloud className="w-4 h-4" />
+                      <span className="text-[10px] font-bold uppercase tracking-widest">上传素材</span>
+                    </button>
+                    <span className="text-[10px] text-slate-500">支持拖拽上传（图片 / PDF / TXT）</span>
+                    {(isUploadingAssets || isPendingAssetTransition) && (
+                      <span className="text-[10px] text-indigo-300 font-medium animate-pulse">处理中...</span>
+                    )}
+                  </div>
+                  <input ref={fileInputRef} type="file" className="hidden" multiple accept="image/*,.pdf,.txt" onChange={handleFileUpload} />
+                  <div className="text-[10px] font-bold text-slate-600 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">智能录入模式</div>
+                </div>
               </div>
 
               {draftAssets.length > 0 && (
@@ -918,9 +1023,14 @@ export function InputSection() {
                         </div>
                         <div className="text-xs text-slate-300 font-sans line-clamp-2 leading-relaxed mb-3">{task.inputExcerpt}</div>
                         <div className="flex items-center justify-between mt-auto">
-                          {task.status === 'processing' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-500"><Loader2 className="w-3 h-3 animate-spin"/> 处理中...</div>}
+                          {task.status === 'processing' && (
+                            <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-500">
+                              <Loader2 className="w-3 h-3 animate-spin"/>
+                              {task.retryCount && task.retryCount > 0 ? `重试中 (${task.retryCount}/${task.maxRetries || maxAutoRetries})` : '处理中...'}
+                            </div>
+                          )}
                           {task.status === 'completed' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-500"><Check className="w-3 h-3"/> 处理完成，点击查看</div>}
-                          {task.status === 'failed' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-rose-500"><AlertCircle className="w-3 h-3"/> 解析失败</div>}
+                          {task.status === 'failed' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-rose-500"><AlertCircle className="w-3 h-3"/> 解析失败 {task.diagnostic ? `(${task.diagnostic.title})` : ''}</div>}
                           
                           {(task.status === 'completed' || task.status === 'failed') && (
                             <button onClick={(e) => { e.stopPropagation(); setTasks(prev => prev.filter(t => t.id !== task.id)); }} className="text-slate-600 hover:text-rose-400 p-1"><Trash2 className="w-3.5 h-3.5" /></button>
@@ -934,9 +1044,53 @@ export function InputSection() {
                 // Task Detail View
                 <div className="space-y-4">
                   {selectedTask.status === 'failed' ? (
-                     <div className="text-rose-400 text-xs p-4 bg-rose-500/10 rounded-xl border border-rose-500/20">{selectedTask.error}</div>
+                     <div className="space-y-3">
+                       <div className="text-rose-400 text-xs p-4 bg-rose-500/10 rounded-xl border border-rose-500/20">{selectedTask.error}</div>
+                       {selectedTask.diagnostic && (
+                         <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-2">
+                           <div className="text-xs font-bold text-slate-200 flex items-center gap-2">
+                             {selectedTask.diagnostic.category === 'network' && <WifiOff className="w-4 h-4 text-amber-400" />}
+                             {selectedTask.diagnostic.category === 'auth' && <KeyRound className="w-4 h-4 text-rose-400" />}
+                             {selectedTask.diagnostic.category === 'rate_limit' && <Gauge className="w-4 h-4 text-indigo-400" />}
+                             {selectedTask.diagnostic.category === 'unknown' && <AlertTriangle className="w-4 h-4 text-slate-400" />}
+                             诊断：{selectedTask.diagnostic.title}
+                           </div>
+                           <p className="text-xs text-slate-400">{selectedTask.diagnostic.hint}</p>
+                         </div>
+                       )}
+                     </div>
                   ) : selectedTask.pendingReview ? (
                     <>
+                      <div className="flex items-center justify-between gap-2 p-3 bg-slate-900/40 border border-slate-800 rounded-xl">
+                        <div className="text-[11px] text-slate-400">这次解析结果是否有帮助？你的反馈会直接影响后续提示词策略。</div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleTaskFeedback(selectedTask.id, 'helpful')}
+                            disabled={!!selectedTask.feedbackStatus}
+                            className={clsx(
+                              'px-3 py-1.5 rounded-lg text-xs transition-colors',
+                              selectedTask.feedbackStatus === 'helpful'
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-slate-800 hover:bg-emerald-600/80 text-slate-200 disabled:opacity-50'
+                            )}
+                          >
+                            <CheckCircle2 className="w-3 h-3 inline-block mr-1" />
+                            有用
+                          </button>
+                          <button
+                            onClick={() => handleTaskFeedback(selectedTask.id, 'inaccurate')}
+                            disabled={!!selectedTask.feedbackStatus}
+                            className={clsx(
+                              'px-3 py-1.5 rounded-lg text-xs transition-colors',
+                              selectedTask.feedbackStatus === 'inaccurate'
+                                ? 'bg-rose-600 text-white'
+                                : 'bg-slate-800 hover:bg-rose-600/80 text-slate-200 disabled:opacity-50'
+                            )}
+                          >
+                            不准
+                          </button>
+                        </div>
+                      </div>
                       {selectedTask.pendingReview.aiAnalysis && <div className="bg-indigo-500/5 border-l-4 border-l-indigo-500 p-3 text-[11px] text-slate-400 leading-relaxed"><Markdown>{selectedTask.pendingReview.aiAnalysis}</Markdown></div>}
                       {selectedTask.pendingReview.parsedItems.map((item, idx) => (
                         <div key={idx} className="bg-slate-900/40 border border-slate-800 rounded-xl p-4 hover:border-emerald-500/30 transition-all font-sans relative">
