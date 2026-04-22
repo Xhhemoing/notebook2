@@ -129,8 +129,6 @@ export interface Settings {
   translationModel?: string; // Translation / language tasks
   ragModel?: string;         // RAG semantic retrieval
   embeddingModel?: string;
-  cloudflareEndpoint?: string;
-  cloudflareToken?: string;
   syncKey?: string; // Per-user key to scope D1 data, prevents conflicts in multi-user deployments
   homeworkPreferences?: string;
   userSymbols?: string; // Meaning of user symbols
@@ -266,6 +264,14 @@ export interface UserFeedbackEvent {
   metadata?: Record<string, unknown>;
 }
 
+export interface SyncMemoryConflict {
+  id: string;
+  memoryId: string;
+  localMemory: Memory;
+  remoteMemory: Memory;
+  detectedAt: number;
+}
+
 export type LinkEntityType = 'memory' | 'node' | 'textbook' | 'resource';
 
 export interface Link {
@@ -299,6 +305,7 @@ export interface AppState {
   draftImages?: string[];
   draftGraphProposal?: { reasoning: string; operations: any[] } | null;
   resources: Resource[];
+  syncConflicts: SyncMemoryConflict[];
 }
 
 export type Action =
@@ -310,7 +317,9 @@ export type Action =
   | { type: 'UPDATE_NODE'; payload: KnowledgeNode }
   | { type: 'DELETE_NODE'; payload: string }
   | { type: 'BATCH_ADD_MEMORIES'; payload: Memory[] }
+  | { type: 'BATCH_UPSERT_MEMORIES_FROM_SYNC'; payload: Memory[] }
   | { type: 'BATCH_ADD_NODES'; payload: KnowledgeNode[] }
+  | { type: 'BATCH_UPSERT_NODES_FROM_SYNC'; payload: KnowledgeNode[] }
   | { type: 'BATCH_DELETE_NODES'; payload: string[] }
   | { type: 'ADD_TEXTBOOK'; payload: Textbook }
   | { type: 'UPDATE_TEXTBOOK'; payload: Textbook }
@@ -322,6 +331,8 @@ export type Action =
   | { type: 'SET_CORRELATIONS'; payload: KnowledgeNode[] }
   | { type: 'SET_LAST_SYNCED'; payload: number }
   | { type: 'SET_LAST_SYNC'; payload: number }
+  | { type: 'UPSERT_SYNC_CONFLICTS'; payload: SyncMemoryConflict[] }
+  | { type: 'RESOLVE_SYNC_CONFLICT'; payload: { memoryId: string; strategy: 'keep_local' | 'use_remote' | 'merge'; mergedFields?: Partial<Pick<Memory, 'content' | 'notes' | 'correctAnswer' | 'errorReason'>> } }
   | { type: 'LOAD_STATE'; payload: AppState }
   | { type: 'ADD_LOG'; payload: Omit<AILog, 'id' | 'timestamp'> & { id?: string; timestamp?: number } }
   | { type: 'CLEAR_LOGS' }

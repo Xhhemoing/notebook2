@@ -1,15 +1,17 @@
 'use client';
 
 import React, { useState } from 'react';
-import { useAppContext } from '@/lib/store';
-import { Cloud, Download, Upload, Loader2, RefreshCw } from 'lucide-react';
-import { pushToCloudflare, pullFromCloudflare } from '@/lib/sync';
+import { syncWithD1, useAppContext } from '@/lib/store';
+import { Cloud, Download, Upload, Loader2, RefreshCw, GitCompareArrows, Check, ArrowRightLeft } from 'lucide-react';
+import { pushToCloudflare } from '@/lib/sync';
 import clsx from 'clsx';
 
 export default function SyncSettings() {
   const { state, dispatch } = useAppContext();
   const [syncing, setSyncing] = useState<'push' | 'pull' | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [activeMergeId, setActiveMergeId] = useState<string | null>(null);
+  const [mergeDrafts, setMergeDrafts] = useState<Record<string, { content: string; notes: string; correctAnswer: string; errorReason: string }>>({});
 
   const handleSync = async (direction: 'push' | 'pull') => {
     setSyncing(direction);
@@ -18,13 +20,8 @@ export default function SyncSettings() {
         const success = await pushToCloudflare(state);
         alert(success ? '同步到云端成功！' : '同步到云端失败，请检查配置。');
       } else {
-        const cloudState = await pullFromCloudflare(state.settings.syncKey || '');
-        if (cloudState) {
-          dispatch({ type: 'LOAD_STATE', payload: cloudState });
-          alert('从云端恢复成功！');
-        } else {
-          alert('从云端恢复失败，可能云端没有数据或配置错误。');
-        }
+        await syncWithD1(state, dispatch);
+        alert('已执行云端拉取与冲突检查。');
       }
     } catch (error: any) {
       console.error('Sync error:', error);
@@ -85,6 +82,42 @@ export default function SyncSettings() {
     setIsDragging(false);
     const file = e.dataTransfer.files?.[0];
     if (file) processImport(file);
+  };
+
+  const startMerge = (memoryId: string) => {
+    const conflict = state.syncConflicts.find((item) => item.memoryId === memoryId);
+    if (!conflict) return;
+    if (!mergeDrafts[memoryId]) {
+      setMergeDrafts((prev) => ({
+        ...prev,
+        [memoryId]: {
+          content: `${conflict.localMemory.content}\n\n--- 云端版本 ---\n${conflict.remoteMemory.content}`,
+          notes: conflict.localMemory.notes || conflict.remoteMemory.notes || '',
+          correctAnswer: conflict.localMemory.correctAnswer || conflict.remoteMemory.correctAnswer || '',
+          errorReason: conflict.localMemory.errorReason || conflict.remoteMemory.errorReason || '',
+        },
+      }));
+    }
+    setActiveMergeId(memoryId);
+  };
+
+  const applyMerge = (memoryId: string) => {
+    const draft = mergeDrafts[memoryId];
+    if (!draft) return;
+    dispatch({
+      type: 'RESOLVE_SYNC_CONFLICT',
+      payload: {
+        memoryId,
+        strategy: 'merge',
+        mergedFields: {
+          content: draft.content,
+          notes: draft.notes,
+          correctAnswer: draft.correctAnswer,
+          errorReason: draft.errorReason,
+        },
+      },
+    });
+    setActiveMergeId((prev) => (prev === memoryId ? null : prev));
   };
 
   return (
@@ -207,6 +240,102 @@ export default function SyncSettings() {
             </div>
           </div>
         </div>
+      </section>
+
+      <section className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-sm">
+        <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+          <GitCompareArrows className="w-4 h-4" />
+          同步冲突处理面板
+        </h3>
+        {state.syncConflicts.length === 0 ? (
+          <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-500">
+            当前没有冲突。若同一记忆在多端都被修改，会在这里显示可视化合并面板。
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {state.syncConflicts.map((conflict) => {
+              const mergeDraft = mergeDrafts[conflict.memoryId];
+              return (
+                <div key={conflict.memoryId} className="p-4 bg-slate-950 border border-amber-900/40 rounded-xl space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-amber-300">记忆冲突：{conflict.localMemory.content.slice(0, 24)}</div>
+                      <div className="text-[10px] text-slate-500">检测时间：{new Date(conflict.detectedAt).toLocaleString('zh-CN')}</div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => dispatch({ type: 'RESOLVE_SYNC_CONFLICT', payload: { memoryId: conflict.memoryId, strategy: 'keep_local' } })}
+                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs"
+                      >
+                        保留本地
+                      </button>
+                      <button
+                        onClick={() => dispatch({ type: 'RESOLVE_SYNC_CONFLICT', payload: { memoryId: conflict.memoryId, strategy: 'use_remote' } })}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs"
+                      >
+                        使用云端
+                      </button>
+                      <button
+                        onClick={() => startMerge(conflict.memoryId)}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs flex items-center gap-1"
+                      >
+                        <ArrowRightLeft className="w-3 h-3" />
+                        合并
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg">
+                      <div className="text-[10px] text-slate-500 mb-1">本地版本</div>
+                      <p className="text-xs text-slate-300 whitespace-pre-wrap">{conflict.localMemory.content}</p>
+                    </div>
+                    <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg">
+                      <div className="text-[10px] text-slate-500 mb-1">云端版本</div>
+                      <p className="text-xs text-slate-300 whitespace-pre-wrap">{conflict.remoteMemory.content}</p>
+                    </div>
+                  </div>
+
+                  {activeMergeId === conflict.memoryId && mergeDraft && (
+                    <div className="space-y-2 p-3 bg-amber-950/20 border border-amber-900/30 rounded-lg">
+                      <div className="text-xs text-amber-200">编辑合并结果</div>
+                      <textarea
+                        value={mergeDraft.content}
+                        onChange={(e) =>
+                          setMergeDrafts((prev) => ({
+                            ...prev,
+                            [conflict.memoryId]: { ...prev[conflict.memoryId], content: e.target.value },
+                          }))
+                        }
+                        className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200"
+                      />
+                      <textarea
+                        value={mergeDraft.notes}
+                        onChange={(e) =>
+                          setMergeDrafts((prev) => ({
+                            ...prev,
+                            [conflict.memoryId]: { ...prev[conflict.memoryId], notes: e.target.value },
+                          }))
+                        }
+                        placeholder="可选：合并后的补充笔记"
+                        className="w-full h-20 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200"
+                      />
+                      <div className="flex justify-end">
+                        <button
+                          onClick={() => applyMerge(conflict.memoryId)}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs flex items-center gap-1"
+                        >
+                          <Check className="w-3 h-3" />
+                          应用合并
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* ── 本地备份 ── */}

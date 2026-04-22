@@ -5,13 +5,18 @@ export const runtime = 'edge';
 // Generic handler for syncing data to Cloudflare D1 with user isolation
 export async function POST(req: NextRequest) {
   try {
-    const authHeader = req.headers.get('Authorization');
     const data = await req.json();
-    const { action, payload, syncKey } = data;
+    const { action, payload } = data || {};
+    const headerSyncKey = req.headers.get('X-Sync-Key')?.trim() || '';
+    const bodySyncKey = typeof data?.syncKey === 'string' ? data.syncKey.trim() : '';
+    const syncKey = headerSyncKey || bodySyncKey;
 
     // 1. Basic Security Checks
     if (!syncKey || typeof syncKey !== 'string' || syncKey.length < 4) {
-      return NextResponse.json({ error: 'Valid Sync Key (min 4 chars) is required for data isolation' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Valid syncKey (min 4 chars) is required via body.syncKey or X-Sync-Key header' },
+        { status: 400 }
+      );
     }
 
     // Access the D1 database binding

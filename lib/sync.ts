@@ -3,25 +3,35 @@ import { AppState } from './types';
 interface SyncRequest {
   action: 'pull' | 'push_memories' | 'push_nodes' | 'push_textbooks' | 'push_resources';
   payload: any;
-  syncKey: string;
+}
+
+const SYNC_KEY_HEADER = 'X-Sync-Key';
+
+function requireValidSyncKey(rawSyncKey: string) {
+  const syncKey = rawSyncKey.trim();
+  if (!syncKey || syncKey.length < 4) {
+    throw new Error('Sync Key is required and must be at least 4 characters.');
+  }
+  return syncKey;
+}
+
+function buildSyncHeaders(syncKey: string) {
+  return {
+    'Content-Type': 'application/json',
+    [SYNC_KEY_HEADER]: syncKey,
+  };
 }
 
 export async function pushToCloudflare(state: AppState) {
   const endpoint = '/api/sync';
-  const syncKey = state.settings.syncKey || '';
-  
-  if (!syncKey) {
-    throw new Error('Sync Key is required for cloud synchronization.');
-  }
+  const syncKey = requireValidSyncKey(state.settings.syncKey || '');
 
   // Helper to send a push action
   const sendPush = async (action: SyncRequest['action'], payload: any) => {
     const response = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ action, payload, syncKey })
+      headers: buildSyncHeaders(syncKey),
+      body: JSON.stringify({ action, payload })
     });
     if (!response.ok) {
       const err = await response.json();
@@ -43,20 +53,14 @@ export async function pushToCloudflare(state: AppState) {
 
 export async function pullFromCloudflare(syncKey: string): Promise<AppState | null> {
   const endpoint = '/api/sync';
-  
-  if (!syncKey) {
-    throw new Error('Sync Key is required for cloud synchronization.');
-  }
+  const validSyncKey = requireValidSyncKey(syncKey);
 
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
+    headers: buildSyncHeaders(validSyncKey),
     body: JSON.stringify({ 
       action: 'pull', 
       payload: { lastSynced: 0 }, // For full pull, can be optimized later
-      syncKey 
     })
   });
   

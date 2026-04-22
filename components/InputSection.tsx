@@ -3,18 +3,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  AlertTriangle,
   BrainCircuit,
   Check,
+  CheckCircle2,
   FileImage,
   FileText,
+  Gauge,
   History,
   Info,
+  KeyRound,
   Layers3,
   Loader2,
+  Network,
+  RotateCw,
   ScanLine,
   Sparkles,
   Trash2,
   UploadCloud,
+  WifiOff,
   Wand2,
   X,
 } from 'lucide-react';
@@ -88,6 +95,15 @@ type PendingReview = {
   aiAnalysis: string;
   identifiedSubject: string;
   options: Record<string, unknown>;
+};
+
+type ParseErrorCategory = 'network' | 'auth' | 'rate_limit' | 'unknown';
+
+type TaskDiagnostic = {
+  category: ParseErrorCategory;
+  title: string;
+  hint: string;
+  retryable: boolean;
 };
 
 type WorkflowMeta = {
@@ -165,6 +181,39 @@ const MANUAL_HIGHLIGHT_META: Record<
     promptLabel: '自定义',
   },
 };
+
+const INGESTION_TEMPLATES: Array<{
+  id: string;
+  label: string;
+  workflow: IngestionMode;
+  seedInput: string;
+  supplementaryInstruction: string;
+}> = [
+  {
+    id: 'mistake-fast',
+    label: '错题录入',
+    workflow: 'image_pro',
+    seedInput: '题目：\n我的答案：\n正确答案：\n错因：',
+    supplementaryInstruction: '优先提取错题、错误原因和对应知识点，输出可直接复习的记忆项。',
+  },
+  {
+    id: 'exam-analysis',
+    label: '整卷分析',
+    workflow: 'exam',
+    seedInput: '请按整卷视角分析：题型分布、薄弱点、优先复习顺序。',
+    supplementaryInstruction: '请对整套资料做结构化分析，输出薄弱知识点与一周复习优先级建议。',
+  },
+  {
+    id: 'vocab-extract',
+    label: '单词提取',
+    workflow: 'image_pro',
+    seedInput: '请提取图片/文本中的生词或短语，并给出 context/meaning/usage/mnemonics。',
+    supplementaryInstruction: '仅输出高价值词汇，避免泛化；优先保留用户手写标注和下划线词。',
+  },
+];
+
+const FEEDBACK_RULE_HELPFUL = '最近反馈：解析结果有用。保持结构化分点、结论先行、可直接复习。';
+const FEEDBACK_RULE_INACCURATE = '最近反馈：解析结果不准。减少猜测，证据不足时明确标注不确定并列出待确认项。';
 
 function createFeedbackEvent(
   partial: Omit<UserFeedbackEvent, 'id' | 'timestamp'>
@@ -342,8 +391,8 @@ function normalizeReviewItem(value: unknown): ReviewItem {
 
 function normalizePendingReviewState(review: any, fallbackSubject: string): PendingReview {
   const parsedItems = (Array.isArray(review.parsedItems) ? review.parsedItems : [])
-    .map((item) => normalizeReviewItem(item))
-    .filter((item) => item.content);
+    .map((item: unknown) => normalizeReviewItem(item))
+    .filter((item: ReviewItem) => Boolean(item.content));
   return {
     id: review.id,
     workflow: review.workflow,
@@ -354,6 +403,79 @@ function normalizePendingReviewState(review: any, fallbackSubject: string): Pend
     identifiedSubject: toDisplayText(review.identifiedSubject) || fallbackSubject,
     options: review.options || {},
   };
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function classifyTaskError(error: unknown): TaskDiagnostic {
+  const message = String((error as any)?.message || error || '').toLowerCase();
+
+  if (
+    message.includes('api key') ||
+    message.includes('unauthorized') ||
+    message.includes('invalid key') ||
+    message.includes('401') ||
+    message.includes('403')
+  ) {
+    return {
+      category: 'auth',
+      title: '密钥或权限异常',
+      hint: '请检查当前解析模型对应的 API Key、供应商配置及权限范围。',
+      retryable: false,
+    };
+  }
+
+  if (
+    message.includes('rate limit') ||
+    message.includes('too many requests') ||
+    message.includes('quota') ||
+    message.includes('429')
+  ) {
+    return {
+      category: 'rate_limit',
+      title: '请求限流',
+      hint: '请求过于频繁或额度不足。系统会自动退避重试，建议稍后再试。',
+      retryable: true,
+    };
+  }
+
+  if (
+    message.includes('network') ||
+    message.includes('failed to fetch') ||
+    message.includes('timeout') ||
+    message.includes('econn') ||
+    message.includes('dns')
+  ) {
+    return {
+      category: 'network',
+      title: '网络连接异常',
+      hint: '网络不稳定或上游服务不可达。系统会自动重试；若持续失败请检查网络。',
+      retryable: true,
+    };
+  }
+
+  return {
+    category: 'unknown',
+    title: '未知错误',
+    hint: '建议先重试一次；若持续失败，请查看日志并检查模型与输入内容。',
+    retryable: false,
+  };
+}
+
+function appendFeedbackLearningNotes(existing: string | undefined, mode: 'helpful' | 'inaccurate') {
+  const rule = mode === 'helpful' ? FEEDBACK_RULE_HELPFUL : FEEDBACK_RULE_INACCURATE;
+  const lines = (existing || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.includes(rule)) {
+    lines.unshift(rule);
+  }
+  return lines.slice(0, 6).join('\n');
 }
 
 function buildManualHighlightsInstruction(highlights: ManualHighlight[], assets: DraftAsset[]) {
@@ -380,11 +502,16 @@ type ParseTask = {
   inputExcerpt: string;
   pendingReview?: PendingReview;
   error?: string;
+  diagnostic?: TaskDiagnostic;
+  retryCount?: number;
+  maxRetries?: number;
   isNew: boolean;
+  feedbackStatus?: 'helpful' | 'inaccurate';
 };
 
 export function InputSection() {
   const { state, dispatch } = useAppContext();
+  const maxAutoRetries = 2;
   const [workflow, setWorkflow] = useState<IngestionMode>('quick');
   const [input, setInput] = useState(state.draftInput || '');
   const [supplementaryInstruction, setSupplementaryInstruction] = useState('');
@@ -414,6 +541,14 @@ export function InputSection() {
   const functionOptions = useMemo(() => Array.from(new Set([...DEFAULT_FUNCTIONS, ...state.memories.map(m => m.functionType)])).filter(Boolean), [state.memories]);
   const purposeOptions = useMemo(() => Array.from(new Set([...DEFAULT_PURPOSES, ...state.memories.map(m => m.purposeType)])).filter(Boolean), [state.memories]);
 
+  const applyTemplate = useCallback((templateId: string) => {
+    const template = INGESTION_TEMPLATES.find((item) => item.id === templateId);
+    if (!template) return;
+    setWorkflow(template.workflow);
+    setSupplementaryInstruction(template.supplementaryInstruction);
+    setInput((prev) => (prev.trim() ? prev : template.seedInput));
+  }, []);
+
   const handleFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     if (!event.target.files) return;
     for (const file of Array.from(event.target.files)) {
@@ -438,6 +573,8 @@ export function InputSection() {
       status: 'processing',
       workflow,
       inputExcerpt: excerpt,
+      retryCount: 0,
+      maxRetries: maxAutoRetries,
       isNew: true,
     };
     
@@ -473,55 +610,97 @@ export function InputSection() {
     setManualHighlights([]);
 
     (async () => {
-      try {
-        const result = await parseNotes(
-          promptText, 
-          snapshots.subject, 
-          snapshots.knowledgeNodes, 
-          snapshots.settings, 
-          snapshots.assets, 
-          snapshots.expFunc !== 'auto' ? snapshots.expFunc : undefined, 
-          snapshots.expPurp !== 'auto' ? snapshots.expPurp : undefined, 
-          undefined, 
-          undefined, 
-          snapshots.funcOptions, 
-          snapshots.purpOptions
-        );
-        
-        const historyItem: InputHistoryItem = { 
-          id: taskId, 
-          timestamp: Date.now(), 
-          subject: snapshots.subject, 
-          workflow: snapshots.workflow, 
-          input: snapshots.input, 
-          images: snapshots.assets, 
-          imageResourceIds: snapshots.imgResourceIds, 
-          supplementaryInstruction: snapshots.supp, 
-          parsedItems: result.parsedItems, 
-          newNodes: result.newNodes, 
-          deletedNodeIds: result.deletedNodeIds, 
-          aiAnalysis: result.analysisProcess, 
-          identifiedSubject: result.identifiedSubject, 
-          options: snapshots.options 
-        };
-        
-        dispatch({ type: 'ADD_INPUT_HISTORY', payload: historyItem });
-        
-        setTasks(prev => prev.map(t => t.id === taskId ? {
-          ...t,
-          status: 'completed',
-          pendingReview: normalizePendingReviewState({ id: taskId, workflow: snapshots.workflow, ...result, options: snapshots.options }, result.identifiedSubject || snapshots.subject)
-        } : t));
+      let attempt = 0;
+      while (attempt <= maxAutoRetries) {
+        try {
+          if (attempt > 0) {
+            setTasks((prev) =>
+              prev.map((task) =>
+                task.id === taskId
+                  ? {
+                      ...task,
+                      retryCount: attempt,
+                    }
+                  : task
+              )
+            );
+          }
 
-      } catch (e: any) { 
-        setTasks(prev => prev.map(t => t.id === taskId ? {
-          ...t,
-          status: 'failed',
-          error: e.message
-        } : t));
+          const result = await parseNotes(
+            promptText, 
+            snapshots.subject, 
+            snapshots.knowledgeNodes, 
+            snapshots.settings, 
+            snapshots.assets, 
+            snapshots.expFunc !== 'auto' ? snapshots.expFunc : undefined, 
+            snapshots.expPurp !== 'auto' ? snapshots.expPurp : undefined, 
+            undefined, 
+            undefined, 
+            snapshots.funcOptions, 
+            snapshots.purpOptions
+          );
+          
+          const historyItem: InputHistoryItem = { 
+            id: taskId, 
+            timestamp: Date.now(), 
+            subject: snapshots.subject, 
+            workflow: snapshots.workflow, 
+            input: snapshots.input, 
+            images: snapshots.assets, 
+            imageResourceIds: snapshots.imgResourceIds, 
+            supplementaryInstruction: snapshots.supp, 
+            parsedItems: result.parsedItems, 
+            newNodes: result.newNodes, 
+            deletedNodeIds: result.deletedNodeIds, 
+            aiAnalysis: result.analysisProcess, 
+            identifiedSubject: result.identifiedSubject, 
+            options: snapshots.options 
+          };
+          
+          dispatch({ type: 'ADD_INPUT_HISTORY', payload: historyItem });
+          
+          setTasks(prev => prev.map(t => t.id === taskId ? {
+            ...t,
+            status: 'completed',
+            error: undefined,
+            diagnostic: undefined,
+            pendingReview: normalizePendingReviewState({ id: taskId, workflow: snapshots.workflow, ...result, options: snapshots.options }, result.identifiedSubject || snapshots.subject)
+          } : t));
+          return;
+        } catch (error: any) {
+          const diagnostic = classifyTaskError(error);
+          if (diagnostic.retryable && attempt < maxAutoRetries) {
+            const delayMs = Math.min(5000, 1000 * (attempt + 1));
+            setTasks((prev) =>
+              prev.map((task) =>
+                task.id === taskId
+                  ? {
+                      ...task,
+                      status: 'processing',
+                      retryCount: attempt + 1,
+                      diagnostic,
+                      error: `${diagnostic.title}，${Math.round(delayMs / 1000)} 秒后自动重试`,
+                    }
+                  : task
+              )
+            );
+            await wait(delayMs);
+            attempt += 1;
+            continue;
+          }
+
+          setTasks(prev => prev.map(t => t.id === taskId ? {
+            ...t,
+            status: 'failed',
+            diagnostic,
+            error: String(error?.message || error || '解析失败'),
+            retryCount: attempt,
+          } : t));
+          return;
+        }
       }
     })();
-  }, [input, draftAssets, workflow, imageOptions, supplementaryInstruction, manualHighlights, state.currentSubject, state.knowledgeNodes, state.settings, selectedModel, explicitFunction, explicitPurpose, functionOptions, purposeOptions, dispatch]);
+  }, [input, draftAssets, workflow, imageOptions, supplementaryInstruction, manualHighlights, state.currentSubject, state.knowledgeNodes, state.settings, selectedModel, explicitFunction, explicitPurpose, functionOptions, purposeOptions, dispatch, maxAutoRetries]);
 
   const persistParsedItems = useCallback(async (task: ParseTask) => {
     if (!task.pendingReview) return;
@@ -577,6 +756,46 @@ export function InputSection() {
     setSelectedTaskId(null);
   }, [state.currentSubject, dispatch, explicitFunction, explicitPurpose, markAsMistake]);
 
+  const handleTaskFeedback = useCallback((taskId: string, mode: 'helpful' | 'inaccurate') => {
+    const targetTask = tasks.find((task) => task.id === taskId);
+    if (!targetTask || targetTask.feedbackStatus) return;
+
+    const sentiment = mode === 'helpful' ? 'positive' : 'negative';
+    dispatch({
+      type: 'ADD_FEEDBACK_EVENT',
+      payload: createFeedbackEvent({
+        subject: state.currentSubject,
+        targetType: 'ingestion',
+        targetId: taskId,
+        signalType: mode === 'helpful' ? 'workflow_used' : 'ingestion_regenerated',
+        sentiment,
+        note: mode === 'helpful' ? '解析结果有用' : '解析结果不准',
+        metadata: {
+          workflow: targetTask.workflow,
+        },
+      }),
+    });
+
+    const nextLearningNotes = appendFeedbackLearningNotes(state.settings.feedbackLearningNotes, mode);
+    dispatch({
+      type: 'UPDATE_SETTINGS',
+      payload: {
+        feedbackLearningNotes: nextLearningNotes,
+      },
+    });
+
+    setTasks((prev) =>
+      prev.map((task) =>
+        task.id === taskId
+          ? {
+              ...task,
+              feedbackStatus: mode,
+            }
+          : task
+      )
+    );
+  }, [dispatch, state.currentSubject, state.settings.feedbackLearningNotes, tasks]);
+
   const viewTask = (taskId: string) => {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, isNew: false } : t));
     setSelectedTaskId(taskId);
@@ -614,12 +833,27 @@ export function InputSection() {
       <div className="flex-1 flex flex-col min-w-0 bg-slate-950 overflow-hidden">
         <div className="h-12 border-b border-slate-900 flex items-center justify-between px-4 bg-slate-950/80 backdrop-blur-md sticky top-0 z-10">
           <div className="flex items-center gap-3"><h2 className="text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-indigo-500 shadow-xl" />{WORKFLOW_META[workflow].label} 工坊</h2></div>
-          <div className="flex items-center gap-2"><button onClick={() => setShowHistory(!showHistory)} className={clsx("p-2 rounded-lg transition-colors", showHistory ? "bg-indigo-500/10 text-indigo-400" : "text-slate-500 hover:text-slate-300")}><History className="w-4 h-4" /></button><ModelSelector /><button disabled={!input.trim() && draftAssets.length === 0} onClick={handleAnalyze} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-black transition-all flex items-center gap-2 shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"><Sparkles className="w-3 h-3" />创建解析任务</button></div>
+          <div className="flex items-center gap-2"><button onClick={() => setShowHistory(!showHistory)} className={clsx("p-2 rounded-lg transition-colors", showHistory ? "bg-indigo-500/10 text-indigo-400" : "text-slate-500 hover:text-slate-300")}><History className="w-4 h-4" /></button><ModelSelector value={selectedModel} onChange={setSelectedModel} /><button disabled={!input.trim() && draftAssets.length === 0} onClick={handleAnalyze} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-black transition-all flex items-center gap-2 shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"><Sparkles className="w-3 h-3" />创建解析任务</button></div>
         </div>
 
         <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
           <div className="flex-1 flex flex-col border-r border-slate-900 min-w-0">
             <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+              <div className="p-3 bg-slate-900/40 border border-slate-800 rounded-2xl">
+                <div className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2">输入任务模板库</div>
+                <div className="flex flex-wrap gap-2">
+                  {INGESTION_TEMPLATES.map((template) => (
+                    <button
+                      key={template.id}
+                      onClick={() => applyTemplate(template.id)}
+                      className="px-3 py-1.5 bg-slate-950 border border-slate-800 hover:border-indigo-500/40 hover:text-indigo-300 rounded-lg text-xs text-slate-300 transition-colors"
+                    >
+                      {template.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="relative bg-slate-900/30 border border-slate-800 rounded-2xl p-2 focus-within:border-indigo-500/50 transition-all">
                 <textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="在此输入文本内容，或上传素材辅助解析..." className="w-full bg-transparent p-2 text-sm text-slate-200 placeholder-slate-600 focus:outline-none min-h-[160px] md:min-h-[220px] resize-none" />
                 <div className="flex items-center justify-between px-2 pb-2"><div className="flex gap-4"><button onClick={() => fileInputRef.current?.click()} className="p-1 text-slate-500 hover:text-indigo-400 transition-colors flex items-center gap-2"><UploadCloud className="w-4 h-4" /><span className="text-[10px] font-bold uppercase tracking-widest">上传素材</span></button></div><input ref={fileInputRef} type="file" className="hidden" multiple accept="image/*,.pdf,.txt" onChange={handleFileUpload} /><div className="text-[10px] font-bold text-slate-600 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">智能录入模式</div></div>

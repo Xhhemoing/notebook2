@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useReducer, useEffect, useState, useRef } from 'react';
-import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook } from './types';
+import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { deleteDB, openDB } from 'idb';
 import { evaluateMemoryQuality, MEMORY_QUALITY_RULE_VERSION, normalizeKnowledgeNodes } from './data/quality';
@@ -99,13 +99,14 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
   try {
     const syncKey = state.settings.syncKey?.trim();
 
-    if (!syncKey) {
-      console.warn('D1 Sync skipped: missing syncKey');
+    if (!syncKey || syncKey.length < 4) {
+      console.warn('D1 Sync skipped: missing or invalid syncKey');
       return;
     }
 
     const headers = {
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'X-Sync-Key': syncKey,
     };
 
     // 1. Pull incremental changes
@@ -115,7 +116,6 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
       body: JSON.stringify({
         action: 'pull',
         payload: { lastSynced: state.lastSynced || 0 },
-        syncKey,
       })
     });
     
@@ -124,8 +124,52 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
       if (contentType && contentType.includes('application/json')) {
         const { data, serverTime } = await pullRes.json();
         if (data) {
-          if (data.memories?.length > 0) dispatch({ type: 'BATCH_ADD_MEMORIES', payload: data.memories });
-          if (data.knowledgeNodes?.length > 0) dispatch({ type: 'BATCH_ADD_NODES', payload: data.knowledgeNodes });
+          const remoteMemories = Array.isArray(data.memories) ? data.memories : [];
+          const remoteNodes = Array.isArray(data.knowledgeNodes) ? data.knowledgeNodes : [];
+          const localMemoryById = new Map(state.memories.map((memory) => [memory.id, memory]));
+          const nonConflictMemories: Memory[] = [];
+          const conflicts: SyncMemoryConflict[] = [];
+
+          for (const remoteMemory of remoteMemories) {
+            const localMemory = localMemoryById.get(remoteMemory.id);
+            if (!localMemory) {
+              nonConflictMemories.push(remoteMemory);
+              continue;
+            }
+
+            const lastSynced = state.lastSynced || 0;
+            const localChanged = (localMemory.updatedAt || localMemory.createdAt || 0) > lastSynced;
+            const remoteChanged = (remoteMemory.updatedAt || remoteMemory.createdAt || 0) > lastSynced;
+            const hasPayloadDiff =
+              localMemory.content !== remoteMemory.content ||
+              (localMemory.notes || '') !== (remoteMemory.notes || '') ||
+              (localMemory.correctAnswer || '') !== (remoteMemory.correctAnswer || '') ||
+              (localMemory.errorReason || '') !== (remoteMemory.errorReason || '') ||
+              JSON.stringify(localMemory.knowledgeNodeIds || []) !== JSON.stringify(remoteMemory.knowledgeNodeIds || []);
+
+            if (localChanged && remoteChanged && hasPayloadDiff) {
+              conflicts.push({
+                id: remoteMemory.id,
+                memoryId: remoteMemory.id,
+                localMemory,
+                remoteMemory,
+                detectedAt: Date.now(),
+              });
+              continue;
+            }
+
+            nonConflictMemories.push(remoteMemory);
+          }
+
+          if (nonConflictMemories.length > 0) {
+            dispatch({ type: 'BATCH_UPSERT_MEMORIES_FROM_SYNC', payload: nonConflictMemories });
+          }
+          if (remoteNodes.length > 0) {
+            dispatch({ type: 'BATCH_UPSERT_NODES_FROM_SYNC', payload: remoteNodes });
+          }
+          if (conflicts.length > 0) {
+            dispatch({ type: 'UPSERT_SYNC_CONFLICTS', payload: conflicts });
+          }
           dispatch({ type: 'SET_LAST_SYNC', payload: serverTime });
         }
       } else {
@@ -141,7 +185,7 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
       const pushRes = await fetch('/api/sync', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ action: 'push_memories', payload: pushMemories, syncKey })
+        body: JSON.stringify({ action: 'push_memories', payload: pushMemories })
       });
       if (!pushRes.ok) console.warn('D1 Sync Push Memories failed:', pushRes.status);
     }
@@ -151,7 +195,7 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
       const pushRes = await fetch('/api/sync', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ action: 'push_nodes', payload: pushNodes, syncKey })
+        body: JSON.stringify({ action: 'push_nodes', payload: pushNodes })
       });
       if (!pushRes.ok) console.warn('D1 Sync Push Nodes failed:', pushRes.status);
     }
@@ -233,6 +277,26 @@ function stringArrayEqual(left: string[] = [], right: string[] = []): boolean {
     if (left[i] !== right[i]) return false;
   }
   return true;
+}
+
+function normalizeMemoryForSync(memory: Memory): Memory {
+  return {
+    ...memory,
+    version: memory.version || 1,
+    status: memory.status || 'active',
+    dataSource: memory.dataSource || 'manual',
+    updatedAt: memory.updatedAt || memory.createdAt || Date.now(),
+  };
+}
+
+function normalizeNodeForSync(node: KnowledgeNode): KnowledgeNode {
+  return {
+    ...node,
+    version: node.version || 1,
+    status: node.status || 'active',
+    dataSource: node.dataSource || 'manual',
+    updatedAt: node.updatedAt || Date.now(),
+  };
 }
 
 function normalizeMemoryForState(
@@ -505,6 +569,7 @@ const baseInitialState: AppState = {
   feedbackEvents: [],
   inputHistory: [],
   resources: [],
+  syncConflicts: [],
   lastSynced: 0
 };
 
@@ -580,15 +645,20 @@ function reducer(state: AppState, action: Action): AppState {
       return finalizeState({
         ...state,
         memories: [
-          ...action.payload.map(memory => ({
-            ...memory,
-            version: memory.version || 1,
-            status: memory.status || 'active',
-            dataSource: memory.dataSource || 'manual',
-            updatedAt: memory.updatedAt || memory.createdAt || Date.now(),
-          })),
+          ...action.payload.map(memory => normalizeMemoryForSync(memory)),
           ...state.memories,
         ],
+      });
+    case 'BATCH_UPSERT_MEMORIES_FROM_SYNC':
+      const memoryMap = new Map(state.memories.map((memory) => [memory.id, memory]));
+      action.payload.forEach((incomingMemory) => {
+        memoryMap.set(incomingMemory.id, normalizeMemoryForSync(incomingMemory));
+      });
+      return finalizeState({
+        ...state,
+        memories: Array.from(memoryMap.values()).sort(
+          (left, right) => (right.updatedAt || right.createdAt || 0) - (left.updatedAt || left.createdAt || 0)
+        ),
       });
     case 'BATCH_ADD_NODES':
       const newNodes = action.payload.filter(newNode => !state.knowledgeNodes.some(existingNode => existingNode.id === newNode.id));
@@ -596,14 +666,17 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         knowledgeNodes: [
           ...state.knowledgeNodes,
-          ...newNodes.map(node => ({
-            ...node,
-            version: node.version || 1,
-            status: node.status || 'active',
-            dataSource: node.dataSource || 'manual',
-            updatedAt: node.updatedAt || Date.now()
-          })),
+          ...newNodes.map(node => normalizeNodeForSync(node)),
         ],
+      });
+    case 'BATCH_UPSERT_NODES_FROM_SYNC':
+      const nodeMap = new Map(state.knowledgeNodes.map((node) => [node.id, node]));
+      action.payload.forEach((incomingNode) => {
+        nodeMap.set(incomingNode.id, normalizeNodeForSync(incomingNode));
+      });
+      return finalizeState({
+        ...state,
+        knowledgeNodes: Array.from(nodeMap.values()),
       });
     case 'BATCH_DELETE_NODES':
       const updatedMemoriesBatch = state.memories.map(m => ({
@@ -656,6 +729,59 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, lastSynced: action.payload };
     case 'SET_LAST_SYNC':
       return { ...state, lastSynced: action.payload };
+    case 'UPSERT_SYNC_CONFLICTS':
+      const conflictMap = new Map(state.syncConflicts.map((conflict) => [conflict.memoryId, conflict]));
+      action.payload.forEach((conflict) => {
+        conflictMap.set(conflict.memoryId, conflict);
+      });
+      return {
+        ...state,
+        syncConflicts: Array.from(conflictMap.values()).sort((left, right) => right.detectedAt - left.detectedAt),
+      };
+    case 'RESOLVE_SYNC_CONFLICT':
+      const conflict = state.syncConflicts.find((item) => item.memoryId === action.payload.memoryId);
+      if (!conflict) return state;
+
+      if (action.payload.strategy === 'keep_local') {
+        return {
+          ...state,
+          syncConflicts: state.syncConflicts.filter((item) => item.memoryId !== action.payload.memoryId),
+        };
+      }
+
+      if (action.payload.strategy === 'use_remote') {
+        const remoteMap = new Map(state.memories.map((memory) => [memory.id, memory]));
+        remoteMap.set(conflict.remoteMemory.id, normalizeMemoryForSync(conflict.remoteMemory));
+        return finalizeState({
+          ...state,
+          memories: Array.from(remoteMap.values()).sort(
+            (left, right) => (right.updatedAt || right.createdAt || 0) - (left.updatedAt || left.createdAt || 0)
+          ),
+          syncConflicts: state.syncConflicts.filter((item) => item.memoryId !== action.payload.memoryId),
+        });
+      }
+
+      const currentLocal = state.memories.find((memory) => memory.id === action.payload.memoryId) || conflict.localMemory;
+      const mergedFields = action.payload.mergedFields || {};
+      const mergedMemory = normalizeMemoryForSync({
+        ...currentLocal,
+        content: mergedFields.content?.trim() || currentLocal.content || conflict.remoteMemory.content,
+        notes: mergedFields.notes ?? currentLocal.notes ?? conflict.remoteMemory.notes,
+        correctAnswer: mergedFields.correctAnswer ?? currentLocal.correctAnswer ?? conflict.remoteMemory.correctAnswer,
+        errorReason: mergedFields.errorReason ?? currentLocal.errorReason ?? conflict.remoteMemory.errorReason,
+        updatedAt: Date.now(),
+        version: Math.max(currentLocal.version || 1, conflict.remoteMemory.version || 1) + 1,
+        dataSource: 'manual',
+      });
+      const mergedMap = new Map(state.memories.map((memory) => [memory.id, memory]));
+      mergedMap.set(mergedMemory.id, mergedMemory);
+      return finalizeState({
+        ...state,
+        memories: Array.from(mergedMap.values()).sort(
+          (left, right) => (right.updatedAt || right.createdAt || 0) - (left.updatedAt || left.createdAt || 0)
+        ),
+        syncConflicts: state.syncConflicts.filter((item) => item.memoryId !== action.payload.memoryId),
+      });
     case 'LOAD_STATE':
       return finalizeState({ 
         ...initialState, 
@@ -670,7 +796,8 @@ function reducer(state: AppState, action: Action): AppState {
           action.payload.currentSubject || initialState.currentSubject
         ),
         resources: action.payload.resources || [],
-        links: action.payload.links || []
+        links: action.payload.links || [],
+        syncConflicts: action.payload.syncConflicts || [],
       });
     case 'ADD_LOG':
       const logWithMetadata = {

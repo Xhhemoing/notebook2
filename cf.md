@@ -249,3 +249,13 @@ npx wrangler pages deploy .vercel/output/static
 *   **容易崩溃**：如果上传了一个 5MB 的 PDF，转为 Base64 后可能达到 7MB，极有可能超出 D1 的单行写入限制，导致保存失败。
 
 **强烈建议**：如果您希望系统稳定运行，请务必引入 Cloudflare R2。将文件上传至 R2，然后将 R2 返回的 URL 存入 D1 的 `url` 字段中，而不是存储 `contentBase64`。
+
+## Docker 并行部署说明（新增）
+
+本仓库现在提供了 Docker 运行准备（`Dockerfile` + `docker-compose.yml`），用于本地或通用容器环境运行 Next.js 应用。
+
+请注意：
+
+1. Docker 路径是**并行部署路径**，不是 Cloudflare D1 绑定方案的替代。
+2. 如果你的同步接口依赖 Cloudflare 的 `DB` 绑定，直接在普通 Docker 环境运行时不会自动获得该绑定。
+3. 生产若继续使用 D1，请优先采用 Cloudflare Pages/Workers 部署链路；Docker 主要用于本地验证、CI 构建和通用容器运行。
