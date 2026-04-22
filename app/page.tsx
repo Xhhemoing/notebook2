@@ -105,8 +105,6 @@ function MainLayout({ currentView, setCurrentView }: { currentView: View, setCur
   );
 }
 
-import { FocusTimer } from '@/components/FocusTimer';
-
 export default function Home() {
   const [currentView, setCurrentView] = useState<View>('dashboard');
 
@@ -115,7 +113,6 @@ export default function Home() {
       <GlobalAIChatProvider>
         <MainLayout currentView={currentView} setCurrentView={setCurrentView} />
         <GlobalAIPanel />
-        <FocusTimer />
       </GlobalAIChatProvider>
     </AppProvider>
   );

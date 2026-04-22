@@ -6,6 +6,7 @@ import { useState, useCallback } from 'react';
 import { clsx } from 'clsx';
 import { ImageModal } from './ImageModal';
 import Markdown from 'react-markdown';
+import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { v4 as uuidv4 } from 'uuid';
 import { createMemoryPayload } from '@/lib/data/commands';

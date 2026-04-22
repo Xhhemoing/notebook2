@@ -6,7 +6,7 @@ pages_build_output_dir = ".vercel/output/static"
 
 
 [[d1_databases]]
-binding = "ai_assistant_db"
+binding = "DB"
 database_name = "ai-assistant-db"
 database_id = "d77130f5-8454-4490-b322-544692054e8f"
 
