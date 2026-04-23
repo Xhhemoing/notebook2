@@ -1,5 +1,6 @@
 import { AILog, AppState, Resource, Settings, UserFeedbackEvent } from './types';
 import { normalizeInputHistoryItems } from './input-history';
+import { buildPromptOptimizationNotes } from './prompting';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -14,10 +15,8 @@ export function getAutoExpireAt(days: number, now = Date.now()) {
   return now + Math.max(1, days) * DAY_MS;
 }
 
-export function buildFeedbackLearningNotes(events: UserFeedbackEvent[]) {
-  if (!events || events.length === 0) return '';
-
-  const recentEvents = events.slice(0, 200);
+export function buildFeedbackLearningNotes(events: UserFeedbackEvent[], logs: AILog[] = []) {
+  const recentEvents = (events || []).slice(0, 200);
   const counts = new Map<string, number>();
   const workflows = new Map<string, number>();
   const notes = new Set<string>();
@@ -38,12 +37,13 @@ export function buildFeedbackLearningNotes(events: UserFeedbackEvent[]) {
 
   const lines: string[] = [];
   const sortedWorkflows = Array.from(workflows.entries()).sort((left, right) => right[1] - left[1]);
+
   if (sortedWorkflows.length > 0) {
     const workflowSummary = sortedWorkflows
       .slice(0, 3)
       .map(([workflow, count]) => `${pluralizeWorkflow(workflow)}(${count})`)
       .join('、');
-    lines.push(`用户最近更常使用的录入流程：${workflowSummary}。`);
+    lines.push(`用户最近更常使用的流程：${workflowSummary}。`);
   }
 
   if ((counts.get('ingestion_regenerated') || 0) >= 2) {
@@ -59,15 +59,19 @@ export function buildFeedbackLearningNotes(events: UserFeedbackEvent[]) {
   }
 
   if ((counts.get('chat_helpful') || 0) > (counts.get('chat_inaccurate') || 0)) {
-    lines.push('当前对话反馈整体偏正向，延续“结构化、直给结论、兼顾依据”的表达方式。');
+    lines.push('当前对话反馈整体偏正向，继续保持“结构化、先给结论、兼顾依据”的表达方式。');
   }
 
   if ((counts.get('resource_pinned') || 0) >= 1) {
-    lines.push('被固定保存的图片/资料通常是高价值样本，后续优化时应优先参考这些资料的格式与信息密度。');
+    lines.push('被固定保存的图片或资料通常是高价值样本，后续优化时应优先参考这些资料的格式与信息密度。');
   }
 
   if (notes.size > 0) {
     lines.push(`用户显式反馈要点：${Array.from(notes).slice(0, 6).join('；')}。`);
+  }
+
+  for (const note of buildPromptOptimizationNotes(logs, recentEvents)) {
+    lines.push(note);
   }
 
   return lines.join('\n');
@@ -143,7 +147,7 @@ export function getExpiredResourceIds(
 }
 
 export function applyDataRetention(state: AppState, now = Date.now()): AppState {
-  const feedbackLearningNotes = buildFeedbackLearningNotes(state.feedbackEvents || []);
+  const feedbackLearningNotes = buildFeedbackLearningNotes(state.feedbackEvents || [], state.logs || []);
   const referencedResourceIds = getReferencedResourceIds(state);
   const normalizedResources = (state.resources || []).map((resource) =>
     normalizeResourceRetention(resource, state.settings)
@@ -154,7 +158,6 @@ export function applyDataRetention(state: AppState, now = Date.now()): AppState 
 
   const resources = normalizedResources.filter((resource) => !expiredResourceIds.has(resource.id));
   const logs = pruneLogs(state.logs || [], state.settings, now);
-  // Preserve history image ids so restored image annotations can still rebind after resource auto-cleanup.
   const inputHistory = normalizeInputHistoryItems(state.inputHistory, state.currentSubject || '数学');
 
   return {

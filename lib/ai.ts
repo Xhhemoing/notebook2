@@ -13,6 +13,7 @@ import {
   ReviewPlanItem
 } from './types';
 import { searchRetrieval } from './retrieval/client';
+import { buildChatPrompt } from './prompting';
 
 // ... (existing imports)
 
@@ -988,7 +989,7 @@ Feedback-derived preferences:
 ${settings.feedbackLearningNotes || 'None.'}
 `;
 
-  const prompt = `
+  let prompt = `
 ${feedbackDirective}
 你是一个高考复习与错题本AI助手。请分析以下学生的作业/笔记/试卷内容（可能包含文本或多张图片/PDF/Word内容）。
 当前用户选择的科目：【${subject}】
@@ -1056,6 +1057,17 @@ ${JSON.stringify(previousParsedItems, null, 2)}
 输入内容/指令：
 ${input || '请分析图片中的作业和标记'}
 `;
+
+  const promptBundle = buildChatPrompt({
+    query,
+    subject,
+    relevantMemories,
+    allNodes,
+    settings,
+    hasImage: Boolean(base64Image),
+  });
+  prompt = promptBundle.prompt;
+  const { promptVersion, diagnostics } = promptBundle;
 
   const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.parseModel, settings);
 
@@ -1561,6 +1573,7 @@ ${memoryContext || '暂无相关记忆。'}
   }];
 
   let result = '';
+  const startedAt = Date.now();
   try {
     if (isCustomOpenAI && customModel) {
       result = await fetchOpenAI(customModel, prompt, base64Image);
@@ -1677,8 +1690,14 @@ ${memoryContext || '暂无相关记忆。'}
       logCallback({
         type: 'chat',
         model: settings.chatModel,
+        promptVersion,
         prompt,
-        response: result
+        response: result,
+        durationMs: Date.now() - startedAt,
+        metadata: {
+          ...diagnostics,
+          responseChars: result.length,
+        },
       });
     }
   } catch (error: any) {
@@ -1686,8 +1705,11 @@ ${memoryContext || '暂无相关记忆。'}
       logCallback({
         type: 'chat',
         model: settings.chatModel,
+        promptVersion,
         prompt,
-        response: `Error: ${error.message}`
+        response: `Error: ${error.message}`,
+        durationMs: Date.now() - startedAt,
+        metadata: diagnostics,
       });
     }
     throw error;

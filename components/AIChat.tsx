@@ -138,6 +138,7 @@ export function AIChat() {
     setImageResourceId(null);
     setSelectedMemoryIds([]);
     setLoading(true);
+    const responseMessageId = uuidv4();
 
     try {
       let ragMemories: any[] = [];
@@ -173,10 +174,12 @@ export function AIChat() {
               type: 'ADD_LOG',
               payload: {
                 ...log,
+                targetId: responseMessageId,
                 subject: state.currentSubject,
                 workflow: 'chat',
                 resourceIds: currentImageResourceId ? [currentImageResourceId] : undefined,
                 metadata: {
+                  ...(log.metadata || {}),
                   selectedMemoryCount: currentSelectedMemories.length,
                   ragEnabled: enableRAG,
                 },
@@ -187,7 +190,7 @@ export function AIChat() {
         state.memories // Pass all memories for the tool
       );
       
-      const aiMsg: Message = { id: (Date.now() + 1).toString(), role: 'ai', content: response };
+      const aiMsg: Message = { id: responseMessageId, role: 'ai', content: response };
       setMessages(prev => [...prev, aiMsg]);
 
       // Background memory extraction

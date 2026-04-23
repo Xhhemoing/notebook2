@@ -7,6 +7,7 @@ import { deleteDB, openDB } from 'idb';
 import { evaluateMemoryQuality, MEMORY_QUALITY_RULE_VERSION, normalizeKnowledgeNodes } from './data/quality';
 import { applyDataRetention, normalizeResourceRetention } from './feedback';
 import { normalizeInputHistoryItems, normalizeInputHistoryItem } from './input-history';
+import { enrichAILog } from './prompting';
 import { syncRetrievalIndex } from './retrieval/client';
 
 const DB_NAME = 'gaokao-ai-db';
@@ -929,9 +930,11 @@ function reducer(state: AppState, action: Action): AppState {
         syncConflicts: action.payload.syncConflicts || [],
       });
     case 'ADD_LOG':
+      const { id: _ignoredId, timestamp: _ignoredTimestamp, ...rawLog } = action.payload;
+      const enrichedLog = enrichAILog(rawLog);
       const logWithMetadata = {
         timestamp: Date.now(),
-        ...action.payload,
+        ...enrichedLog,
         id: uuidv4(), // Always generate a new unique ID to fix React key warning
       };
       return finalizeState({ ...state, logs: [logWithMetadata, ...state.logs].slice(0, 500) });

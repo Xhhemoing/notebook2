@@ -265,6 +265,12 @@ export interface AILog {
   model: string;
   prompt: string;
   response: string;
+  promptVersion?: string;
+  targetId?: string;
+  durationMs?: number;
+  qualityScore?: number;
+  qualitySummary?: string;
+  qualityIssues?: string[];
   subject?: Subject;
   sessionId?: string;
   workflow?: IngestionMode | 'chat';
