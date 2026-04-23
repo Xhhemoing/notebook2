@@ -219,7 +219,7 @@ export async function syncWithD1(state: AppState, dispatch: React.Dispatch<Actio
       if (!pushRes.ok) console.warn('D1 Sync Push Review Events failed:', pushRes.status);
     }
 
-    const pushFSRSProfiles = (state.fsrsProfiles || []).filter(profile => (profile.optimizedAt || 0) > (state.lastSynced || 0));
+    const pushFSRSProfiles = (state.fsrsProfiles || []).filter(profile => (profile.updatedAt || profile.optimizedAt || 0) > (state.lastSynced || 0));
     if (pushFSRSProfiles.length > 0) {
       const pushRes = await fetch('/api/sync', {
         method: 'POST',
@@ -345,6 +345,7 @@ function normalizeFSRSProfileForSync(profile: FSRSProfile): FSRSProfile {
     desiredRetention: profile.desiredRetention || 0.9,
     recommendedRetention: profile.recommendedRetention || profile.desiredRetention || 0.9,
     cmrrLowerBound: profile.cmrrLowerBound || 0.9,
+    updatedAt: profile.updatedAt || profile.optimizedAt || Date.now(),
     eventCount: profile.eventCount || 0,
     distinctMemoryCount: profile.distinctMemoryCount || 0,
     status: profile.status || 'collecting',
@@ -1246,7 +1247,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             payload: {
               status: 'ready',
               dirty: false,
-              pendingDocumentCount: Number(result?.indexed || 0),
+              pendingDocumentCount: 0,
               lastIndexedAt: Number(result?.indexedAt || Date.now()),
               lastError: undefined,
             },

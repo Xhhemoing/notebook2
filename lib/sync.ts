@@ -1,7 +1,7 @@
 import { AppState } from './types';
 
 interface SyncRequest {
-  action: 'pull' | 'push_memories' | 'push_nodes' | 'push_textbooks' | 'push_resources';
+  action: 'pull' | 'push_memories' | 'push_nodes' | 'push_textbooks' | 'push_resources' | 'push_review_events' | 'push_fsrs_profiles';
   payload: any;
 }
 
@@ -44,6 +44,8 @@ export async function pushToCloudflare(state: AppState) {
   await sendPush('push_memories', state.memories);
   // Push nodes
   await sendPush('push_nodes', state.knowledgeNodes);
+  await sendPush('push_review_events', state.reviewEvents || []);
+  await sendPush('push_fsrs_profiles', state.fsrsProfiles || []);
   
   // Note: textbooks and resources might need their own push actions if implemented in backend
   // For now, these are the ones supported by the backend

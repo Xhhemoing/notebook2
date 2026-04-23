@@ -9,6 +9,21 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
+      QDRANT_URL: http://qdrant:6333
     ports:
       - "3000:3000"
+    depends_on:
+      - qdrant
     restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    container_name: ai-studio-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:

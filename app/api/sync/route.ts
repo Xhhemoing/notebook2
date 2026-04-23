@@ -2,6 +2,86 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'edge';
 
+async function ensureSyncTables(db: any) {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS memories (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      content TEXT NOT NULL,
+      functionType TEXT,
+      purposeType TEXT,
+      isMistake INTEGER DEFAULT 0,
+      wrongAnswer TEXT,
+      errorReason TEXT,
+      visualDescription TEXT,
+      notes TEXT,
+      knowledgeNodeIds TEXT,
+      createdAt INTEGER NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      embedding TEXT
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_nodes (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      name TEXT NOT NULL,
+      parentId TEXT,
+      "order" INTEGER DEFAULT 0,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS textbooks (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      name TEXT NOT NULL,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS resources (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      name TEXT,
+      type TEXT,
+      size INTEGER DEFAULT 0,
+      isFolder INTEGER DEFAULT 0,
+      updatedAt INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS review_events (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      memoryId TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      rating INTEGER NOT NULL,
+      reviewedAt INTEGER NOT NULL,
+      elapsedDays INTEGER DEFAULT 0,
+      scheduledDays INTEGER DEFAULT 0,
+      previousState INTEGER,
+      nextState INTEGER,
+      stabilityBefore REAL,
+      stabilityAfter REAL,
+      difficultyBefore REAL,
+      difficultyAfter REAL,
+      mode TEXT
+    );
+    CREATE TABLE IF NOT EXISTS fsrs_profiles (
+      id TEXT PRIMARY KEY,
+      syncKey TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      parameters TEXT NOT NULL,
+      desiredRetention REAL NOT NULL,
+      recommendedRetention REAL NOT NULL,
+      cmrrLowerBound REAL NOT NULL,
+      updatedAt INTEGER NOT NULL,
+      optimizedAt INTEGER,
+      eventCount INTEGER DEFAULT 0,
+      distinctMemoryCount INTEGER DEFAULT 0,
+      status TEXT NOT NULL,
+      notes TEXT
+    );
+  `);
+}
+
 // Generic handler for syncing data to Cloudflare D1 with user isolation
 export async function POST(req: NextRequest) {
   try {
@@ -29,6 +109,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    await ensureSyncTables(db);
+
     // 2. Action Handlers with syncKey Isolation
     if (action === 'pull') {
       const { lastSynced = 0 } = payload || {};
@@ -44,6 +126,12 @@ export async function POST(req: NextRequest) {
         .bind(syncKey, lastSynced).all();
       
       const resources = await db.prepare('SELECT * FROM resources WHERE syncKey = ? AND updatedAt > ?')
+        .bind(syncKey, lastSynced).all();
+
+      const reviewEvents = await db.prepare('SELECT * FROM review_events WHERE syncKey = ? AND reviewedAt > ?')
+        .bind(syncKey, lastSynced).all();
+
+      const fsrsProfiles = await db.prepare('SELECT * FROM fsrs_profiles WHERE syncKey = ? AND updatedAt > ?')
         .bind(syncKey, lastSynced).all();
       
       return NextResponse.json({
@@ -65,7 +153,31 @@ export async function POST(req: NextRequest) {
             ...r,
             isFolder: !!r.isFolder,
             size: Number(r.size)
-          }))
+          })),
+          reviewEvents: reviewEvents.results.map((event: any) => ({
+            ...event,
+            rating: Number(event.rating),
+            reviewedAt: Number(event.reviewedAt),
+            elapsedDays: Number(event.elapsedDays || 0),
+            scheduledDays: Number(event.scheduledDays || 0),
+            previousState: event.previousState !== null ? Number(event.previousState) : undefined,
+            nextState: event.nextState !== null ? Number(event.nextState) : undefined,
+            stabilityBefore: event.stabilityBefore !== null ? Number(event.stabilityBefore) : undefined,
+            stabilityAfter: event.stabilityAfter !== null ? Number(event.stabilityAfter) : undefined,
+            difficultyBefore: event.difficultyBefore !== null ? Number(event.difficultyBefore) : undefined,
+            difficultyAfter: event.difficultyAfter !== null ? Number(event.difficultyAfter) : undefined,
+          })),
+          fsrsProfiles: fsrsProfiles.results.map((profile: any) => ({
+            ...profile,
+            parameters: profile.parameters ? JSON.parse(profile.parameters) : [],
+            desiredRetention: Number(profile.desiredRetention || 0.9),
+            recommendedRetention: Number(profile.recommendedRetention || 0.9),
+            cmrrLowerBound: Number(profile.cmrrLowerBound || 0.9),
+            updatedAt: Number(profile.updatedAt || 0),
+            optimizedAt: profile.optimizedAt !== null ? Number(profile.optimizedAt) : undefined,
+            eventCount: Number(profile.eventCount || 0),
+            distinctMemoryCount: Number(profile.distinctMemoryCount || 0),
+          })),
         },
         serverTime: Date.now()
       });
@@ -118,6 +230,86 @@ export async function POST(req: NextRequest) {
           "order" = excluded."order",
           updatedAt = excluded.updatedAt
       `).bind(n.id, syncKey, n.subject, n.name, n.parentId, n.order || 0, now));
+
+      await db.batch(statements);
+      return NextResponse.json({ success: true, serverTime: now });
+    }
+
+    if (action === 'push_review_events') {
+      const items = payload as any[];
+      if (items.length === 0) return NextResponse.json({ success: true });
+
+      const statements = items.map((event) => db.prepare(`
+        INSERT INTO review_events (id, syncKey, memoryId, subject, rating, reviewedAt, elapsedDays, scheduledDays, previousState, nextState, stabilityBefore, stabilityAfter, difficultyBefore, difficultyAfter, mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          rating = excluded.rating,
+          reviewedAt = excluded.reviewedAt,
+          elapsedDays = excluded.elapsedDays,
+          scheduledDays = excluded.scheduledDays,
+          previousState = excluded.previousState,
+          nextState = excluded.nextState,
+          stabilityBefore = excluded.stabilityBefore,
+          stabilityAfter = excluded.stabilityAfter,
+          difficultyBefore = excluded.difficultyBefore,
+          difficultyAfter = excluded.difficultyAfter,
+          mode = excluded.mode
+      `).bind(
+        event.id,
+        syncKey,
+        event.memoryId,
+        event.subject,
+        event.rating,
+        event.reviewedAt,
+        event.elapsedDays || 0,
+        event.scheduledDays || 0,
+        event.previousState ?? null,
+        event.nextState ?? null,
+        event.stabilityBefore ?? null,
+        event.stabilityAfter ?? null,
+        event.difficultyBefore ?? null,
+        event.difficultyAfter ?? null,
+        event.mode || 'standard',
+      ));
+
+      await db.batch(statements);
+      return NextResponse.json({ success: true, serverTime: Date.now() });
+    }
+
+    if (action === 'push_fsrs_profiles') {
+      const items = payload as any[];
+      if (items.length === 0) return NextResponse.json({ success: true });
+
+      const now = Date.now();
+      const statements = items.map((profile) => db.prepare(`
+        INSERT INTO fsrs_profiles (id, syncKey, subject, parameters, desiredRetention, recommendedRetention, cmrrLowerBound, updatedAt, optimizedAt, eventCount, distinctMemoryCount, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          parameters = excluded.parameters,
+          desiredRetention = excluded.desiredRetention,
+          recommendedRetention = excluded.recommendedRetention,
+          cmrrLowerBound = excluded.cmrrLowerBound,
+          updatedAt = excluded.updatedAt,
+          optimizedAt = excluded.optimizedAt,
+          eventCount = excluded.eventCount,
+          distinctMemoryCount = excluded.distinctMemoryCount,
+          status = excluded.status,
+          notes = excluded.notes
+      `).bind(
+        profile.id,
+        syncKey,
+        profile.subject,
+        JSON.stringify(profile.parameters || []),
+        profile.desiredRetention || 0.9,
+        profile.recommendedRetention || 0.9,
+        profile.cmrrLowerBound || 0.9,
+        profile.updatedAt || now,
+        profile.optimizedAt ?? null,
+        profile.eventCount || 0,
+        profile.distinctMemoryCount || 0,
+        profile.status || 'collecting',
+        profile.notes || null,
+      ));
 
       await db.batch(statements);
       return NextResponse.json({ success: true, serverTime: now });

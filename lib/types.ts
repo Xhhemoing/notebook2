@@ -200,6 +200,7 @@ export interface FSRSProfile {
   desiredRetention: number;
   recommendedRetention: number;
   cmrrLowerBound: number;
+  updatedAt?: number;
   optimizedAt?: number;
   eventCount: number;
   distinctMemoryCount: number;

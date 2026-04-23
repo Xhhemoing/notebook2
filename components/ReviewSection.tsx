@@ -6,7 +6,8 @@ import { generateQuizzes, QuizQuestion } from '@/lib/ai';
 import { Memory } from '@/lib/types';
 import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen, Download, CalendarDays, Target } from 'lucide-react';
 import { clsx } from 'clsx';
-import { reviewCard, Rating, Grade, calculateMetrics } from '@/lib/fsrs';
+import { reviewCard, Rating, Grade, calculateMetrics, createReviewEvent } from '@/lib/fsrs';
+import { buildFSRSProfile, getSubjectFSRSProfile } from '@/lib/fsrs-profile';
 import Markdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -26,6 +27,11 @@ export function ReviewSection() {
   const [customDifficulty, setCustomDifficulty] = useState(5);
   const [isPrinting, setIsPrinting] = useState(false);
 
+  const subjectProfile = useMemo(
+    () => getSubjectFSRSProfile(state.fsrsProfiles || [], state.currentSubject),
+    [state.fsrsProfiles, state.currentSubject]
+  );
+
   const memoriesToReview = state.memories
     .filter(m => m.subject === state.currentSubject)
     .sort((a, b) => {
@@ -36,8 +42,8 @@ export function ReviewSection() {
       if (aDue >= Date.now() && bDue < Date.now()) return 1;
       
       // Calculate real-time confidence for sorting
-      const aMetrics = calculateMetrics(a.fsrs, a.lastReviewed);
-      const bMetrics = calculateMetrics(b.fsrs, b.lastReviewed);
+      const aMetrics = calculateMetrics(a.fsrs, a.lastReviewed, new Date(), subjectProfile);
+      const bMetrics = calculateMetrics(b.fsrs, b.lastReviewed, new Date(), subjectProfile);
       
       // Then sort by confidence (lower confidence first)
       return aMetrics.confidence - bMetrics.confidence;
@@ -152,9 +158,11 @@ export function ReviewSection() {
   };
 
   const handleFinish = () => {
+    const reviewedAt = Date.now();
     // Apply all evaluations to FSRS
     // For joint quizzes, one evaluation might apply to multiple memories
     const memoryEvaluations: Record<string, Grade[]> = {};
+    const newEvents = [];
 
     quizzes.forEach((quiz, idx) => {
       const rating = evaluations[idx];
@@ -172,8 +180,18 @@ export function ReviewSection() {
       const memory = state.memories.find(m => m.id === mid);
       if (memory) {
         const minRating = Math.min(...ratings) as Grade;
-        const newFsrs = reviewCard(memory.fsrs, minRating);
-        const { confidence, mastery } = calculateMetrics(newFsrs, Date.now());
+        const profile = getSubjectFSRSProfile(state.fsrsProfiles || [], memory.subject);
+        const newFsrs = reviewCard(memory.fsrs, minRating, new Date(reviewedAt), profile);
+        const { confidence, mastery } = calculateMetrics(newFsrs, reviewedAt, new Date(reviewedAt), profile);
+        const reviewEvent = createReviewEvent({
+          memory,
+          rating: minRating,
+          reviewedAt,
+          previousFsrs: memory.fsrs,
+          nextFsrs: newFsrs,
+          mode: isJoint ? 'joint' : reviewMode,
+        });
+        newEvents.push(reviewEvent);
 
         dispatch({
           type: 'UPDATE_MEMORY',
@@ -182,11 +200,19 @@ export function ReviewSection() {
             fsrs: newFsrs,
             confidence,
             mastery,
-            lastReviewed: Date.now()
+            lastReviewed: reviewedAt
           }
         });
+        dispatch({ type: 'ADD_REVIEW_EVENT', payload: reviewEvent });
       }
     });
+
+    const nextProfile = buildFSRSProfile(
+      state.currentSubject,
+      [...(state.reviewEvents || []), ...newEvents],
+      state.settings.fsrsDesiredRetention
+    );
+    dispatch({ type: 'UPSERT_FSRS_PROFILE', payload: nextProfile });
 
     // Reset state for next review
     setStarted(false);
@@ -626,7 +652,7 @@ export function ReviewSection() {
                         关联原始记忆点 ({associatedMemories.length})
                       </h4>
                       {associatedMemories.map(memory => {
-                        const metrics = calculateMetrics(memory.fsrs, memory.lastReviewed);
+                        const metrics = calculateMetrics(memory.fsrs, memory.lastReviewed, new Date(), subjectProfile);
                         return (
                           <div key={memory.id} className="bg-slate-900/50 p-4 rounded-xl border border-slate-800">
                             <div className="text-sm text-slate-300 prose prose-invert prose-sm max-w-none">

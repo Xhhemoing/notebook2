@@ -13,3 +13,9 @@ database_id = "d77130f5-8454-4490-b322-544692054e8f"
 [vars]
 # Add your environment variables here
 # NEXT_PUBLIC_GEMINI_API_KEY = ""
+# QDRANT_URL = ""
+# QDRANT_API_KEY = ""
+# RERANKER_URL = ""
+# RERANKER_API_KEY = ""
+# LATE_INTERACTION_URL = ""
+# LATE_INTERACTION_API_KEY = ""

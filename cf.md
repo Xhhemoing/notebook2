@@ -259,3 +259,17 @@ npx wrangler pages deploy .vercel/output/static
 1. Docker 路径是**并行部署路径**，不是 Cloudflare D1 绑定方案的替代。
 2. 如果你的同步接口依赖 Cloudflare 的 `DB` 绑定，直接在普通 Docker 环境运行时不会自动获得该绑定。
 3. 生产若继续使用 D1，请优先采用 Cloudflare Pages/Workers 部署链路；Docker 主要用于本地验证、CI 构建和通用容器运行。
+## 服务端检索依赖
+
+新版检索把索引视为派生数据，D1 仍保存业务真源数据，Qdrant 保存检索索引。
+
+Cloudflare Pages/Functions 不内置本地 Qdrant，需要连接外部 HTTP Endpoint：
+
+- `QDRANT_URL`
+- `QDRANT_API_KEY`
+- `RERANKER_URL`（可选）
+- `RERANKER_API_KEY`（可选）
+- `LATE_INTERACTION_URL`（可选）
+- `LATE_INTERACTION_API_KEY`（可选）
+
+未配置 reranker 或 late interaction provider 时，系统会自动降级到 `dense + sparse + fusion`，不会影响基础问答与复习流程。

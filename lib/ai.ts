@@ -12,6 +12,7 @@ import {
   ReviewPlan,
   ReviewPlanItem
 } from './types';
+import { searchRetrieval } from './retrieval/client';
 
 // ... (existing imports)
 
@@ -306,6 +307,28 @@ export async function searchTextbooks(
   settings: Settings,
   limit: number = 3
 ): Promise<{ page: TextbookPage; textbookId: string; textbookName: string; score: number }[]> {
+  if (settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
+    try {
+      const { hits } = await searchRetrieval({
+        query,
+        syncKey: settings.syncKey.trim(),
+        settings,
+      });
+      return hits
+        .filter((hit) => hit.document.kind === 'textbook_page')
+        .map((hit) => {
+          const textbook = textbooks.find((item) => item.id === hit.document.sourceTextbookId);
+          const page = textbook?.pages.find((item) => item.pageNumber === hit.document.sourceTextbookPage);
+          if (!textbook || !page) return null;
+          return { page, textbookId: textbook.id, textbookName: textbook.name, score: hit.score };
+        })
+        .filter(Boolean)
+        .slice(0, limit) as { page: TextbookPage; textbookId: string; textbookName: string; score: number }[];
+    } catch (error) {
+      console.warn('Server textbook retrieval failed, fallback to local search:', error);
+    }
+  }
+
   const queryEmbedding = await getEmbedding(query, settings);
   const results: { page: TextbookPage; textbookId: string; textbookName: string; score: number }[] = [];
 
@@ -331,6 +354,26 @@ export async function searchMemoriesRAG(
   limit: number = 5,
   base64Image?: string
 ): Promise<Memory[]> {
+  if (!base64Image && settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
+    try {
+      const { hits } = await searchRetrieval({
+        query,
+        syncKey: settings.syncKey.trim(),
+        subject: memories[0]?.subject,
+        settings,
+      });
+      const orderedMemoryIds = hits
+        .filter((hit) => hit.document.kind === 'memory')
+        .map((hit) => hit.document.sourceId);
+      return orderedMemoryIds
+        .map((id) => memories.find((memory) => memory.id === id))
+        .filter(Boolean)
+        .slice(0, limit) as Memory[];
+    } catch (error) {
+      console.warn('Server memory retrieval failed, fallback to local search:', error);
+    }
+  }
+
   let embeddingInput: any[] = [];
   if (query && query.trim() !== '') {
     embeddingInput.push(query);
@@ -378,6 +421,41 @@ export async function searchAllRAG(
   limit: number = 5,
   base64Image?: string
 ): Promise<{ type: 'memory' | 'textbook'; item: any; score: number }[]> {
+  if (!base64Image && settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
+    try {
+      const { hits } = await searchRetrieval({
+        query,
+        syncKey: settings.syncKey.trim(),
+        subject: memories[0]?.subject,
+        settings,
+      });
+      return hits
+        .map((hit) => {
+          if (hit.document.kind === 'memory') {
+            const memory = memories.find((item) => item.id === hit.document.sourceId);
+            return memory ? { type: 'memory' as const, item: memory, score: hit.score } : null;
+          }
+
+          if (hit.document.kind === 'textbook_page') {
+            const textbook = textbooks.find((item) => item.id === hit.document.sourceTextbookId);
+            const page = textbook?.pages.find((item) => item.pageNumber === hit.document.sourceTextbookPage);
+            if (!textbook || !page) return null;
+            return {
+              type: 'textbook' as const,
+              item: { textbookId: textbook.id, textbookName: textbook.name, ...page },
+              score: hit.score,
+            };
+          }
+
+          return null;
+        })
+        .filter(Boolean)
+        .slice(0, limit) as { type: 'memory' | 'textbook'; item: any; score: number }[];
+    } catch (error) {
+      console.warn('Server hybrid retrieval failed, fallback to local search:', error);
+    }
+  }
+
   let embeddingInput: any[] = [];
   if (query && query.trim() !== '') {
     embeddingInput.push(query);
