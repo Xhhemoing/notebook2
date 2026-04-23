@@ -33,6 +33,7 @@ export async function searchRetrieval(params: {
   query: string;
   syncKey: string;
   subject?: string;
+  nodeIds?: string[];
   settings: Settings;
 }): Promise<{ hits: RetrievalHit[]; mode: string; warnings: string[] }> {
   const response = await fetch('/api/retrieval/search', {
@@ -44,6 +45,7 @@ export async function searchRetrieval(params: {
     body: JSON.stringify({
       query: params.query,
       subject: params.subject,
+      nodeIds: params.nodeIds,
       settings: {
         embeddingModel: params.settings.embeddingModel,
         customProviders: params.settings.customProviders,

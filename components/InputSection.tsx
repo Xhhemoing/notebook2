@@ -18,7 +18,6 @@ import {
   UploadCloud,
   WifiOff,
   Wand2,
-  X,
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import rehypeKatex from 'rehype-katex';
@@ -27,12 +26,13 @@ import { clsx } from 'clsx';
 import { v4 as uuidv4 } from 'uuid';
 
 import { useAppContext } from '@/lib/store';
-import { parseNotes } from '@/lib/ai';
+import { inferModelProvider, parseNotes, resolveAIPresetSettings } from '@/lib/ai';
 import { getInitialFSRSData } from '@/lib/fsrs';
 import { createMemoryPayload } from '@/lib/data/commands';
-import { getAutoExpireAt } from '@/lib/feedback';
+import { buildKnowledgeNodePath, formatKnowledgeNodePath, inferKnowledgeNodeKind, isAttachableKnowledgeNode, isFormalMemoryEligible } from '@/lib/data/quality';
+import { FEEDBACK_QUICK_TAGS, getAutoExpireAt } from '@/lib/feedback';
 import { normalizeInputHistoryItem, normalizeInputHistoryWorkflow } from '@/lib/input-history';
-import { InputHistoryItem, IngestionMode, Resource, UserFeedbackEvent } from '@/lib/types';
+import { GraphScope, InputHistoryItem, IngestionMode, KnowledgeNode, Memory, UserFeedbackEvent } from '@/lib/types';
 import { ModelSelector } from '@/components/ModelSelector';
 import { ImageAnnotator, ImageAnnotation } from '@/components/ImageAnnotator';
 
@@ -60,19 +60,40 @@ type ManualHighlight = {
 type ReviewItem = {
   content: string;
   type?: 'concept' | 'qa' | 'vocabulary';
+  questionNo?: string;
   questionType?: string;
+  studentAnswer?: string;
   correctAnswer?: string;
   notes?: string;
   nodeIds?: string[];
   isMistake?: boolean;
   wrongAnswer?: string;
+  confidence?: number;
+  needsConfirmation?: boolean;
+  conflict?: boolean;
   errorReason?: string;
+  errorReasonCategory?: string;
+  evidence?: {
+    sourceText?: string;
+    locationHint?: string;
+    keySentence?: string;
+  };
+  optionAnalysis?: Record<string, string>;
+  learningTask?: string;
+  transferExercises?: string[];
+  memoryCard?: {
+    front?: string;
+    back?: string;
+  };
+  reviewPriority?: 'high' | 'medium' | 'low' | 'summary_only';
   vocabularyData?: {
     meaning?: string;
     usage?: string;
     context?: string;
     mnemonics?: string;
     synonyms?: string[];
+    originalSentence?: string;
+    confusions?: string[];
   };
   visualDescription?: string;
   functionType?: string;
@@ -85,6 +106,7 @@ type PendingReview = {
   id: string;
   workflow: IngestionMode;
   parsedItems: ReviewItem[];
+  resourceIds: string[];
   newNodes: any[];
   deletedNodeIds: string[];
   aiAnalysis: string;
@@ -99,6 +121,22 @@ type TaskDiagnostic = {
   title: string;
   hint: string;
   retryable: boolean;
+};
+
+type AnchorPreview = {
+  itemIndex: number;
+  status: 'ok' | 'blocked';
+  nodeIds: string[];
+  path: string;
+  note: string;
+  reason?: string;
+  createdNodes: KnowledgeNode[];
+};
+
+type AnchoringPlan = {
+  items: ReviewItem[];
+  previews: AnchorPreview[];
+  nodesToCreate: KnowledgeNode[];
 };
 
 type WorkflowMeta = {
@@ -348,6 +386,52 @@ function toStringArray(value: unknown): string[] {
   return normalized ? [normalized] : [];
 }
 
+function normalizeConfidenceValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value <= 1 ? Math.round(value * 100) : Math.round(value);
+  if (typeof value === 'string') {
+    const parsed = Number(value.replace('%', '').trim());
+    if (Number.isFinite(parsed)) return parsed <= 1 ? Math.round(parsed * 100) : Math.round(parsed);
+  }
+  return undefined;
+}
+
+function normalizeStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([key, val]) => [key.trim(), toDisplayText(val)] as const)
+    .filter(([key, val]) => key.length > 0 && val.length > 0);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function normalizeEvidence(value: unknown): ReviewItem['evidence'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const evidence = {
+    sourceText: toDisplayText(record.sourceText) || undefined,
+    locationHint: toDisplayText(record.locationHint) || undefined,
+    keySentence: toDisplayText(record.keySentence) || undefined,
+  };
+  return evidence.sourceText || evidence.locationHint || evidence.keySentence ? evidence : undefined;
+}
+
+function normalizeMemoryCard(value: unknown): ReviewItem['memoryCard'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const card = {
+    front: toDisplayText(record.front) || undefined,
+    back: toDisplayText(record.back) || undefined,
+  };
+  return card.front || card.back ? card : undefined;
+}
+
+function normalizeReviewPriority(value: unknown): ReviewItem['reviewPriority'] | undefined {
+  const normalized = toDisplayText(value).toLowerCase();
+  if (normalized === 'high' || normalized === 'medium' || normalized === 'low' || normalized === 'summary_only') {
+    return normalized;
+  }
+  return undefined;
+}
+
 function normalizeVocabularyDetails(value: unknown): ReviewItem['vocabularyData'] | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const record = value as Record<string, unknown>;
@@ -357,8 +441,20 @@ function normalizeVocabularyDetails(value: unknown): ReviewItem['vocabularyData'
     context: toDisplayText(record.context) || undefined,
     mnemonics: toDisplayText(record.mnemonics) || undefined,
     synonyms: Array.from(new Set(toStringArray(record.synonyms))),
+    originalSentence: toDisplayText(record.originalSentence) || undefined,
+    confusions: Array.from(new Set(toStringArray(record.confusions))),
   };
-  return (normalized.meaning || normalized.usage || normalized.context || normalized.mnemonics || normalized.synonyms.length > 0) ? normalized : undefined;
+  return (
+    normalized.meaning ||
+    normalized.usage ||
+    normalized.context ||
+    normalized.mnemonics ||
+    normalized.synonyms.length > 0 ||
+    normalized.originalSentence ||
+    normalized.confusions.length > 0
+  )
+    ? normalized
+    : undefined;
 }
 
 function normalizeReviewItem(value: unknown): ReviewItem {
@@ -368,13 +464,25 @@ function normalizeReviewItem(value: unknown): ReviewItem {
   return {
     content: toDisplayText(record.content) || toDisplayText(record.notes) || toDisplayText(record.correctAnswer) || '未命名内容',
     type,
+    questionNo: toDisplayText(record.questionNo) || undefined,
     questionType: toDisplayText(record.questionType) || undefined,
+    studentAnswer: toDisplayText(record.studentAnswer) || undefined,
     correctAnswer: toDisplayText(record.correctAnswer) || undefined,
     notes: toDisplayText(record.notes) || undefined,
     nodeIds: Array.from(new Set(toStringArray(record.nodeIds))),
     isMistake: record.isMistake === true || toDisplayText(record.isMistake).toLowerCase() === 'true',
     wrongAnswer: toDisplayText(record.wrongAnswer) || undefined,
+    confidence: normalizeConfidenceValue(record.confidence),
+    needsConfirmation: record.needsConfirmation === true || toDisplayText(record.needsConfirmation).toLowerCase() === 'true',
+    conflict: record.conflict === true || toDisplayText(record.conflict).toLowerCase() === 'true',
     errorReason: toDisplayText(record.errorReason) || undefined,
+    errorReasonCategory: toDisplayText(record.errorReasonCategory) || undefined,
+    evidence: normalizeEvidence(record.evidence),
+    optionAnalysis: normalizeStringRecord(record.optionAnalysis),
+    learningTask: toDisplayText(record.learningTask) || undefined,
+    transferExercises: Array.from(new Set(toStringArray(record.transferExercises))),
+    memoryCard: normalizeMemoryCard(record.memoryCard),
+    reviewPriority: normalizeReviewPriority(record.reviewPriority),
     vocabularyData: normalizeVocabularyDetails(record.vocabularyData),
     visualDescription: toDisplayText(record.visualDescription) || undefined,
     functionType: toDisplayText(record.functionType) || undefined,
@@ -392,12 +500,79 @@ function normalizePendingReviewState(review: any, fallbackSubject: string): Pend
     id: review.id,
     workflow: review.workflow,
     parsedItems,
+    resourceIds: Array.from(new Set(toStringArray(review.resourceIds))),
     newNodes: Array.isArray(review.newNodes) ? review.newNodes : [],
     deletedNodeIds: Array.from(new Set(toStringArray(review.deletedNodeIds))),
     aiAnalysis: toDisplayText(review.aiAnalysis),
     identifiedSubject: toDisplayText(review.identifiedSubject) || fallbackSubject,
     options: review.options || {},
   };
+}
+
+function evaluateReviewItemForSave(args: {
+  item: ReviewItem;
+  pendingReview: PendingReview;
+  subject: string;
+  explicitFunction: string;
+  explicitPurpose: string;
+  markAsMistake: boolean;
+  now: number;
+}): { memory: Memory | null; score: number; flags: string[]; eligible: boolean } {
+  const { item, pendingReview, subject, explicitFunction, explicitPurpose, markAsMistake, now } = args;
+  const isMistake = item.isMistake || markAsMistake;
+  const payload = {
+    id: uuidv4(),
+    subject,
+    content: item.content,
+    correctAnswer: item.correctAnswer,
+    questionNo: item.questionNo,
+    questionType: item.questionType,
+    studentAnswer: item.studentAnswer,
+    source: item.source,
+    sourceResourceIds: pendingReview.resourceIds,
+    region: item.region,
+    notes: item.notes,
+    functionType: explicitFunction !== 'auto' ? explicitFunction : item.functionType || DEFAULT_FUNCTIONS[0],
+    purposeType: explicitPurpose !== 'auto' ? explicitPurpose : item.purposeType || DEFAULT_PURPOSES[0],
+    knowledgeNodeIds: item.nodeIds || [],
+    confidence: item.confidence ?? 50,
+    mastery: 0,
+    createdAt: now,
+    updatedAt: now,
+    sourceType: 'text' as const,
+    isMistake,
+    wrongAnswer: item.wrongAnswer || item.studentAnswer,
+    errorReason: item.errorReason,
+    visualDescription: item.visualDescription,
+    analysisProcess: pendingReview.aiAnalysis,
+    needsConfirmation: item.needsConfirmation,
+    conflict: item.conflict,
+    errorReasonCategory: item.errorReasonCategory,
+    evidence: item.evidence,
+    optionAnalysis: item.optionAnalysis,
+    learningTask: item.learningTask,
+    transferExercises: item.transferExercises,
+    memoryCard: item.memoryCard,
+    reviewPriority: item.reviewPriority,
+    fsrs: item.reviewPriority === 'summary_only' ? undefined : getInitialFSRSData(),
+    type: item.type,
+    vocabularyData: item.vocabularyData,
+    dataSource: 'ai_parse' as const,
+    ingestionMode: pendingReview.workflow,
+    ingestionSessionId: pendingReview.id,
+  };
+
+  const result = createMemoryPayload(payload);
+  if (!result.ok) {
+    return { memory: null, score: 0, flags: ['invalid_payload'], eligible: false };
+  }
+
+  const quality = {
+    score: result.value.qualityScore ?? 0,
+    flags: result.value.qualityFlags || [],
+  };
+  const eligible = item.reviewPriority !== 'summary_only' && isFormalMemoryEligible(result.value, quality);
+  return { memory: result.value, score: quality.score, flags: quality.flags, eligible };
 }
 
 function wait(ms: number) {
@@ -473,6 +648,210 @@ function appendFeedbackLearningNotes(existing: string | undefined, mode: 'helpfu
   return lines.slice(0, 6).join('\n');
 }
 
+function normalizeNodeName(value: string) {
+  return value.replace(/\s+/g, '').toLowerCase();
+}
+
+function deriveAnchorName(item: ReviewItem) {
+  const base =
+    item.learningTask ||
+    item.questionType ||
+    item.questionNo ||
+    item.content ||
+    item.notes ||
+    '待细化知识点';
+  return base.replace(/\s+/g, ' ').trim().slice(0, 24) || '待细化知识点';
+}
+
+function inferAnchorLeafKind(item: ReviewItem) {
+  const text = [item.functionType, item.purposeType, item.learningTask, item.content, item.notes].filter(Boolean).join(' ');
+  return /方法|解题|步骤|策略|技巧|模型|套路/.test(text) ? 'method' : 'knowledge';
+}
+
+function makeChildNode(parent: KnowledgeNode, name: string, nodes: KnowledgeNode[], subject: string): KnowledgeNode {
+  const siblings = nodes.filter((node) => node.subject === subject && node.parentId === parent.id);
+  return {
+    id: uuidv4(),
+    subject,
+    name,
+    parentId: parent.id,
+    order: siblings.length + 1,
+    kind: inferKnowledgeNodeKind({ id: uuidv4(), subject, name, parentId: parent.id, order: siblings.length + 1 }, [...nodes]),
+    dataSource: 'ai_parse',
+    status: 'active',
+    version: 1,
+    updatedAt: Date.now(),
+  };
+}
+
+function ensureAttachableNodeUnderParent(args: {
+  parent: KnowledgeNode;
+  item: ReviewItem;
+  subject: string;
+  nodes: KnowledgeNode[];
+  createdNodes: KnowledgeNode[];
+}): { node: KnowledgeNode | null; createdNodes: KnowledgeNode[]; note: string } {
+  const { parent, item, subject } = args;
+  let nodes = [...args.nodes, ...args.createdNodes];
+  const createdNodes = [...args.createdNodes];
+  const targetKind = inferAnchorLeafKind(item);
+  let current = parent;
+  let currentKind = current.kind || inferKnowledgeNodeKind(current, nodes);
+  const baseName = deriveAnchorName(item);
+
+  if (currentKind === 'knowledge' || currentKind === 'method') {
+    return { node: current, createdNodes, note: '复用当前可挂载节点' };
+  }
+
+  const descendants = nodes.filter((node) => buildKnowledgeNodePath(nodes, node.id).some((pathNode) => pathNode.id === parent.id));
+  const sameNameLeaf = descendants.find(
+    (node) =>
+      isAttachableKnowledgeNode(node, nodes) &&
+      (normalizeNodeName(baseName).includes(normalizeNodeName(node.name)) || normalizeNodeName(node.name).includes(normalizeNodeName(baseName)))
+  );
+  if (sameNameLeaf) {
+    return { node: sameNameLeaf, createdNodes, note: '复用当前子树同名叶子节点' };
+  }
+
+  while (currentKind !== 'knowledge' && currentKind !== 'method') {
+    const nextName =
+      currentKind === 'root'
+        ? item.region || item.functionType || '综合模块'
+        : currentKind === 'module'
+          ? item.questionType || item.purposeType || '待细分主题'
+          : targetKind === 'method'
+            ? `${baseName}方法`
+            : baseName;
+    const existing = nodes.find(
+      (node) =>
+        node.subject === subject &&
+        node.parentId === current.id &&
+        normalizeNodeName(node.name) === normalizeNodeName(nextName)
+    );
+    const child = existing || makeChildNode(current, nextName, nodes, subject);
+    if (!existing) {
+      createdNodes.push(child);
+      nodes = [...nodes, child];
+    }
+    current = child;
+    currentKind = current.kind || inferKnowledgeNodeKind(current, nodes);
+  }
+
+  return {
+    node: current,
+    createdNodes,
+    note: createdNodes.length > args.createdNodes.length ? '已自动补齐中间层级' : '复用已有层级',
+  };
+}
+
+function buildAnchoringPlan(args: {
+  pendingReview: PendingReview;
+  currentNodes: KnowledgeNode[];
+  activeScope: GraphScope;
+}): AnchoringPlan {
+  const { pendingReview, currentNodes, activeScope } = args;
+  const subject = pendingReview.identifiedSubject;
+  const subjectNodes = currentNodes.filter((node) => node.subject === subject);
+  const generatedNodes = (pendingReview.newNodes || [])
+    .filter((node: any) => node?.id && node?.name)
+    .map((node: any) => ({
+      ...node,
+      subject,
+      kind: node.kind || inferKnowledgeNodeKind(node as KnowledgeNode, [...subjectNodes, ...(pendingReview.newNodes || [])]),
+      dataSource: 'ai_parse' as const,
+      status: 'active' as const,
+      version: 1,
+      updatedAt: Date.now(),
+    })) as KnowledgeNode[];
+  let workingNodes = [...subjectNodes, ...generatedNodes];
+  const nodesToCreate: KnowledgeNode[] = [];
+  const previews: AnchorPreview[] = [];
+  const items: ReviewItem[] = [];
+
+  pendingReview.parsedItems.forEach((item, itemIndex) => {
+    const candidateIds = Array.from(new Set(item.nodeIds || []));
+    const existingLeafIds = candidateIds.filter((id) => {
+      const node = workingNodes.find((candidate) => candidate.id === id);
+      return isAttachableKnowledgeNode(node, workingNodes);
+    });
+
+    if (existingLeafIds.length > 0) {
+      items.push({ ...item, nodeIds: existingLeafIds });
+      previews.push({
+        itemIndex,
+        status: 'ok',
+        nodeIds: existingLeafIds,
+        path: formatKnowledgeNodePath(workingNodes, existingLeafIds[0]),
+        note: '复用已有 knowledge/method 节点',
+        createdNodes: [],
+      });
+      return;
+    }
+
+    const activeNode = activeScope.subject === subject && activeScope.nodeId
+      ? workingNodes.find((node) => node.id === activeScope.nodeId)
+      : undefined;
+    const sameNameLeaf = workingNodes.find(
+      (node) =>
+        node.subject === subject &&
+        isAttachableKnowledgeNode(node, workingNodes) &&
+        normalizeNodeName(item.content).includes(normalizeNodeName(node.name))
+    );
+    const parent = activeNode || sameNameLeaf;
+
+    if (!parent) {
+      items.push({ ...item, nodeIds: [] });
+      previews.push({
+        itemIndex,
+        status: 'blocked',
+        nodeIds: [],
+        path: '',
+        note: '未入库',
+        reason: '缺少当前导图节点或可复用叶子节点，无法确定父级',
+        createdNodes: [],
+      });
+      return;
+    }
+
+    const result = ensureAttachableNodeUnderParent({
+      parent,
+      item,
+      subject,
+      nodes: workingNodes,
+      createdNodes: nodesToCreate,
+    });
+
+    nodesToCreate.splice(0, nodesToCreate.length, ...result.createdNodes);
+    workingNodes = [...subjectNodes, ...generatedNodes, ...nodesToCreate];
+
+    if (!result.node) {
+      items.push({ ...item, nodeIds: [] });
+      previews.push({
+        itemIndex,
+        status: 'blocked',
+        nodeIds: [],
+        path: '',
+        note: '未入库',
+        reason: '自动补层失败，无法生成 knowledge/method 叶子',
+        createdNodes: [],
+      });
+      return;
+    }
+
+    items.push({ ...item, nodeIds: [result.node.id] });
+    previews.push({
+      itemIndex,
+      status: 'ok',
+      nodeIds: [result.node.id],
+      path: formatKnowledgeNodePath(workingNodes, result.node.id),
+      note: result.note,
+      createdNodes: result.createdNodes,
+    });
+  });
+
+  return { items, previews, nodesToCreate };
+}
+
 function buildManualHighlightsInstruction(highlights: ManualHighlight[], assets: DraftAsset[]) {
   const assetNameMap = new Map(assets.map((asset) => [asset.resourceId, asset.name]));
   const lines = ['【用户手动重点标注】'];
@@ -502,10 +881,14 @@ type ParseTask = {
   maxRetries?: number;
   isNew: boolean;
   feedbackStatus?: 'helpful' | 'inaccurate';
+  feedbackTag?: string;
 };
+
+type WorkspacePage = 'compose' | 'history';
 
 export function InputSection() {
   const { state, dispatch } = useAppContext();
+  const effectiveSettings = useMemo(() => resolveAIPresetSettings(state.settings), [state.settings]);
   const maxAutoRetries = 2;
   const [workflow, setWorkflow] = useState<IngestionMode>('quick');
   const [input, setInput] = useState(state.draftInput || '');
@@ -515,8 +898,8 @@ export function InputSection() {
   
   const [tasks, setTasks] = useState<ParseTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-
-  const [showHistory, setShowHistory] = useState(false);
+  const [activePage, setActivePage] = useState<WorkspacePage>('compose');
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState(state.settings.parseModel);
   const [explicitFunction, setExplicitFunction] = useState<string>('auto');
   const [explicitPurpose, setExplicitPurpose] = useState<string>('auto');
@@ -533,6 +916,21 @@ export function InputSection() {
     prioritizeAccuracy: true,
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const currentScope = useMemo(
+    () => (state.activeGraphScope?.subject === state.currentSubject ? state.activeGraphScope : null),
+    [state.activeGraphScope, state.currentSubject]
+  );
+  const currentScopePath = useMemo(
+    () =>
+      currentScope?.nodeId
+        ? formatKnowledgeNodePath(
+            state.knowledgeNodes.filter((node) => node.subject === state.currentSubject),
+            currentScope.nodeId
+          )
+        : '',
+    [currentScope, state.currentSubject, state.knowledgeNodes]
+  );
 
   useEffect(() => { setSelectedModel(state.settings.parseModel); }, [state.settings.parseModel]);
 
@@ -645,7 +1043,8 @@ export function InputSection() {
     };
     
     setTasks(prev => [newTask, ...prev]);
-    setSelectedTaskId(null); // Return to task list view to see it processing
+    setSelectedTaskId(taskId);
+    setActivePage('history');
 
     const promptText = [
       buildWorkflowInstruction(workflow, imageOptions, supplementaryInstruction), 
@@ -714,7 +1113,28 @@ export function InputSection() {
             undefined, 
             undefined, 
             snapshots.funcOptions, 
-            snapshots.purpOptions
+            snapshots.purpOptions,
+            (log) =>
+              dispatch({
+                type: 'ADD_LOG',
+                payload: {
+                  ...log,
+                  targetId: log.targetId || taskId,
+                  sessionId: log.sessionId || taskId,
+                  subject: log.subject || snapshots.subject,
+                  workflow: log.workflow || snapshots.workflow,
+                  resourceIds: log.resourceIds || snapshots.imgResourceIds,
+                  metadata: {
+                    ...(log.metadata || {}),
+                    targetId: taskId,
+                    sessionId: taskId,
+                    workflow: snapshots.workflow,
+                    resourceIds: snapshots.imgResourceIds,
+                    imageCount: parseAssets.length,
+                    options: snapshots.options,
+                  },
+                },
+              })
           );
           
           const historyItem: InputHistoryItem = { 
@@ -741,7 +1161,10 @@ export function InputSection() {
             status: 'completed',
             error: undefined,
             diagnostic: undefined,
-            pendingReview: normalizePendingReviewState({ id: taskId, workflow: snapshots.workflow, ...result, options: snapshots.options }, result.identifiedSubject || snapshots.subject)
+            pendingReview: normalizePendingReviewState(
+              { id: taskId, workflow: snapshots.workflow, resourceIds: snapshots.imgResourceIds, ...result, options: snapshots.options },
+              result.identifiedSubject || snapshots.subject
+            )
           } : t));
           return;
         } catch (error: any) {
@@ -783,59 +1206,58 @@ export function InputSection() {
     if (!task.pendingReview) return;
     const { pendingReview } = task;
 
+    const anchoringPlan = buildAnchoringPlan({
+      pendingReview,
+      currentNodes: state.knowledgeNodes,
+      activeScope: state.activeGraphScope,
+    });
+    const anchoredPendingReview = { ...pendingReview, parsedItems: anchoringPlan.items };
+
     if (pendingReview.identifiedSubject !== state.currentSubject) dispatch({ type: 'SET_SUBJECT', payload: pendingReview.identifiedSubject });
-    if (pendingReview.newNodes.length > 0) dispatch({ type: 'BATCH_ADD_NODES', payload: pendingReview.newNodes });
+    if (anchoringPlan.nodesToCreate.length > 0) dispatch({ type: 'BATCH_ADD_NODES', payload: anchoringPlan.nodesToCreate });
     if (pendingReview.deletedNodeIds.length > 0) dispatch({ type: 'BATCH_DELETE_NODES', payload: pendingReview.deletedNodeIds });
     const now = Date.now();
 
-    // Since we cleared draftAssets earlier, we must rely on history or task context if we want to link images.
-    // However, pending tasks don't store asset models directly. But for simplicity, we'll link them if we pass the ids.
-    // For now we don't have draftAssets mapped here, let's omit image linking in task saving unless we stored it in ParseTask.
-    // To fix this quickly, we just use text.
-    
-    const memories = pendingReview.parsedItems.map(item => {
-      const res = createMemoryPayload({ 
-        id: uuidv4(), 
-        subject: pendingReview.identifiedSubject, 
-        content: item.content, 
-        correctAnswer: item.correctAnswer, 
-        questionType: item.questionType, 
-        source: item.source, 
-        region: item.region, 
-        notes: item.notes, 
-        functionType: explicitFunction !== 'auto' ? explicitFunction : item.functionType || DEFAULT_FUNCTIONS[0], 
-        purposeType: explicitPurpose !== 'auto' ? explicitPurpose : item.purposeType || DEFAULT_PURPOSES[0], 
-        knowledgeNodeIds: item.nodeIds || [], 
-        confidence: 50, 
-        mastery: 0, 
-        createdAt: now, 
-        updatedAt: now, 
-        sourceType: 'text', 
-        isMistake: item.isMistake || markAsMistake, 
-        wrongAnswer: item.wrongAnswer, 
-        errorReason: item.errorReason, 
-        visualDescription: item.visualDescription, 
-        analysisProcess: pendingReview.aiAnalysis, 
-        fsrs: getInitialFSRSData(), 
-        type: item.type, 
-        vocabularyData: item.vocabularyData, 
-        dataSource: 'ai_parse', 
-        ingestionMode: pendingReview.workflow, 
-        ingestionSessionId: pendingReview.id 
-      });
-      return res.ok ? res.value : null;
-    }).filter(Boolean);
+    const evaluations = anchoringPlan.items.map((item) =>
+      evaluateReviewItemForSave({
+        item,
+        pendingReview: anchoredPendingReview,
+        subject: pendingReview.identifiedSubject,
+        explicitFunction,
+        explicitPurpose,
+        markAsMistake,
+        now,
+      })
+    );
+
+    const memories = evaluations
+      .filter((evaluation): evaluation is typeof evaluation & { memory: Memory } => Boolean(evaluation.eligible && evaluation.memory))
+      .map((evaluation) => evaluation.memory);
+    const retainedItems = anchoringPlan.items.filter((_, index) => !evaluations[index]?.eligible);
 
     if (memories.length > 0) dispatch({ type: 'BATCH_ADD_MEMORIES', payload: memories } as any);
-    
-    // Remove task from active list
+
+    if (retainedItems.length > 0) {
+      setTasks(prev => prev.map(t => t.id === task.id ? {
+        ...t,
+        pendingReview: { ...pendingReview, parsedItems: retainedItems, newNodes: [] },
+      } : t));
+      return;
+    }
+
     setTasks(prev => prev.filter(t => t.id !== task.id));
     setSelectedTaskId(null);
-  }, [state.currentSubject, dispatch, explicitFunction, explicitPurpose, markAsMistake]);
+  }, [dispatch, explicitFunction, explicitPurpose, markAsMistake, state.activeGraphScope, state.currentSubject, state.knowledgeNodes]);
 
-  const handleTaskFeedback = useCallback((taskId: string, mode: 'helpful' | 'inaccurate') => {
+  const handleTaskFeedback = useCallback((taskId: string, mode: 'helpful' | 'inaccurate', feedbackTag?: string) => {
     const targetTask = tasks.find((task) => task.id === taskId);
-    if (!targetTask || targetTask.feedbackStatus) return;
+    if (!targetTask) return;
+
+    const nextFeedbackTag = mode === 'inaccurate' ? feedbackTag || targetTask.feedbackTag : undefined;
+    const isSameFeedback =
+      targetTask.feedbackStatus === mode &&
+      (mode === 'helpful' || targetTask.feedbackTag === nextFeedbackTag);
+    if (isSameFeedback) return;
 
     const sentiment = mode === 'helpful' ? 'positive' : 'negative';
     dispatch({
@@ -846,9 +1268,20 @@ export function InputSection() {
         targetId: taskId,
         signalType: mode === 'helpful' ? 'workflow_used' : 'ingestion_regenerated',
         sentiment,
-        note: mode === 'helpful' ? '解析结果有用' : '解析结果不准',
+        note:
+          mode === 'helpful'
+            ? '解析结果有帮助'
+            : nextFeedbackTag
+              ? `解析结果需要调整：${nextFeedbackTag}`
+              : '解析结果不准',
         metadata: {
           workflow: targetTask.workflow,
+          preset: effectiveSettings.aiPreset || 'balanced',
+          provider: inferModelProvider(selectedModel, state.settings),
+          model: selectedModel,
+          graphScopeNodeId: currentScope?.nodeId || null,
+          graphScopePath: currentScopePath || null,
+          feedbackTag: nextFeedbackTag,
         },
       }),
     });
@@ -867,11 +1300,21 @@ export function InputSection() {
           ? {
               ...task,
               feedbackStatus: mode,
+              feedbackTag: nextFeedbackTag,
             }
           : task
       )
     );
-  }, [dispatch, state.currentSubject, state.settings.feedbackLearningNotes, tasks]);
+  }, [
+    currentScope?.nodeId,
+    currentScopePath,
+    dispatch,
+    effectiveSettings.aiPreset,
+    selectedModel,
+    state.currentSubject,
+    state.settings,
+    tasks,
+  ]);
 
   const viewTask = (taskId: string) => {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, isNew: false } : t));
@@ -882,8 +1325,18 @@ export function InputSection() {
     const norm = normalizeInputHistoryItem(item, state.currentSubject) || item;
     setWorkflow(normalizeInputHistoryWorkflow(norm.workflow, norm.images?.length || 0, norm.parsedItems?.length || 0));
     setInput(toDisplayText(norm.input));
+    setSupplementaryInstruction(toDisplayText(norm.supplementaryInstruction));
+    if (norm.options && typeof norm.options === 'object') {
+      setImageOptions((prev) => ({
+        ...prev,
+        enhanceImage: typeof norm.options?.enhanceImage === 'boolean' ? norm.options.enhanceImage : prev.enhanceImage,
+        preserveAnnotations: typeof norm.options?.preserveAnnotations === 'boolean' ? norm.options.preserveAnnotations : prev.preserveAnnotations,
+        splitQuestions: typeof norm.options?.splitQuestions === 'boolean' ? norm.options.splitQuestions : prev.splitQuestions,
+        extractVocabulary: typeof norm.options?.extractVocabulary === 'boolean' ? norm.options.extractVocabulary : prev.extractVocabulary,
+      }));
+    }
     setDraftAssets((norm.images || []).map((img, i) => ({ resourceId: norm.imageResourceIds?.[i] || uuidv4(), name: `Hist-${i+1}`, preview: toDisplayText(img), type: 'image/*', size: 0 })));
-    setShowHistory(false);
+    setActivePage('compose');
   }, [state.currentSubject]);
 
   const sortedTasks = useMemo(() => {
@@ -893,30 +1346,124 @@ export function InputSection() {
     });
   }, [tasks]);
 
+  const historyItems = useMemo(() => {
+    return [...state.inputHistory]
+      .reverse()
+      .map((item) => normalizeInputHistoryItem(item, state.currentSubject) || item);
+  }, [state.inputHistory, state.currentSubject]);
+
   const selectedTask = tasks.find(t => t.id === selectedTaskId);
+  const selectedHistoryItem = historyItems.find((item) => item.id === selectedHistoryId) || historyItems[0] || null;
+  const selectedTaskReviewEvaluations = useMemo(() => {
+    if (!selectedTask?.pendingReview) return [];
+    const anchoringPlan = buildAnchoringPlan({
+      pendingReview: selectedTask.pendingReview,
+      currentNodes: state.knowledgeNodes,
+      activeScope: state.activeGraphScope,
+    });
+    return anchoringPlan.items.map((item) =>
+      evaluateReviewItemForSave({
+        item,
+        pendingReview: { ...selectedTask.pendingReview!, parsedItems: anchoringPlan.items },
+        subject: selectedTask.pendingReview!.identifiedSubject,
+        explicitFunction,
+        explicitPurpose,
+        markAsMistake,
+        now: Date.now(),
+      })
+    );
+  }, [selectedTask, explicitFunction, explicitPurpose, markAsMistake, state.knowledgeNodes, state.activeGraphScope]);
+
+  const selectedTaskAnchorPreviews = useMemo(() => {
+    if (!selectedTask?.pendingReview) return [];
+    return buildAnchoringPlan({
+      pendingReview: selectedTask.pendingReview,
+      currentNodes: state.knowledgeNodes,
+      activeScope: state.activeGraphScope,
+    }).previews;
+  }, [selectedTask, state.knowledgeNodes, state.activeGraphScope]);
+
+  const selectedTaskSaveStats = useMemo(() => {
+    return selectedTaskReviewEvaluations.reduce(
+      (stats, evaluation) => ({
+        approved: stats.approved + (evaluation.eligible ? 1 : 0),
+        pending: stats.pending + (evaluation.eligible ? 0 : 1),
+      }),
+      { approved: 0, pending: 0 }
+    );
+  }, [selectedTaskReviewEvaluations]);
 
   return (
     <div className="flex flex-col h-full bg-black select-none overflow-hidden sm:flex-row">
-      <div className="w-full sm:w-16 md:w-20 lg:w-24 bg-slate-900 border-b sm:border-b-0 sm:border-r border-slate-800 flex sm:flex-col items-center py-2 sm:py-4 gap-4 px-4 sm:px-0 shrink-0">
+      <div className="w-full sm:w-16 md:w-20 lg:w-24 bg-slate-900 border-b sm:border-b-0 sm:border-r border-slate-800 flex sm:flex-col items-center py-2 sm:py-4 gap-3 px-4 sm:px-0 shrink-0">
         <div className="p-2 bg-indigo-500/10 rounded-xl hidden sm:block"><BrainCircuit className="w-6 h-6 text-indigo-400" /></div>
-        {(Object.keys(WORKFLOW_META) as IngestionMode[]).map((mode) => {
-          const meta = WORKFLOW_META[mode];
-          const Icon = meta.icon;
-          const isActive = workflow === mode;
-          return <button key={mode} onClick={() => setWorkflow(mode)} title={meta.label} className={clsx('group relative p-2 md:p-3 rounded-2xl transition-all', isActive ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-800 hover:text-slate-300')}><Icon className="w-5 h-5 md:w-6 md:h-6" /><span className="text-[10px] font-bold block sm:hidden">{meta.label}</span></button>;
+        {([
+          { id: 'compose' as const, label: '录入', icon: Wand2 },
+          { id: 'history' as const, label: '历史', icon: History, count: sortedTasks.length + state.inputHistory.length },
+        ]).map((page) => {
+          const Icon = page.icon;
+          const isActive = activePage === page.id;
+          return (
+            <button
+              key={page.id}
+              onClick={() => setActivePage(page.id)}
+              title={page.label}
+              className={clsx('group relative p-2 md:p-3 rounded-2xl transition-all flex items-center gap-1.5 sm:block', isActive ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-800 hover:text-slate-300')}
+            >
+              <Icon className="w-5 h-5 md:w-6 md:h-6" />
+              <span className="text-[10px] font-bold block sm:hidden">{page.label}</span>
+              {Boolean(page.count) && <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-emerald-500 text-[9px] font-black text-white flex items-center justify-center">{page.count}</span>}
+            </button>
+          );
         })}
       </div>
 
       <div className="flex-1 flex flex-col min-w-0 bg-slate-950 overflow-hidden">
         <div className="h-12 border-b border-slate-900 flex items-center justify-between px-4 bg-slate-950/80 backdrop-blur-md sticky top-0 z-10">
-          <div className="flex items-center gap-3"><h2 className="text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-indigo-500 shadow-xl" />{WORKFLOW_META[workflow].label} 工坊</h2></div>
-          <div className="flex items-center gap-2"><button onClick={() => setShowHistory(!showHistory)} className={clsx("p-2 rounded-lg transition-colors", showHistory ? "bg-indigo-500/10 text-indigo-400" : "text-slate-500 hover:text-slate-300")}><History className="w-4 h-4" /></button><ModelSelector value={selectedModel} onChange={setSelectedModel} /><button disabled={!input.trim() && draftAssets.length === 0} onClick={handleAnalyze} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-black transition-all flex items-center gap-2 shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"><Sparkles className="w-3 h-3" />创建解析任务</button></div>
+          <div className="flex items-center gap-3">
+            <h2 className="text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-indigo-500 shadow-xl" />
+              {activePage === 'compose' ? '新建录入' : '历史与状态'}
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            {activePage === 'compose' && (
+              <>
+                <ModelSelector value={selectedModel} onChange={setSelectedModel} />
+                <button disabled={!input.trim() && draftAssets.length === 0} onClick={handleAnalyze} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-black transition-all flex items-center gap-2 shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"><Sparkles className="w-3 h-3" />创建解析任务</button>
+              </>
+            )}
+            {activePage !== 'compose' && (
+              <button onClick={() => setActivePage('compose')} className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-black transition-all flex items-center gap-2"><Wand2 className="w-3 h-3" />新建录入</button>
+            )}
+          </div>
         </div>
 
         <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
-          <div className="flex-1 flex flex-col border-r border-slate-900 min-w-0">
+          <div className={clsx("flex-1 flex flex-col min-w-0", activePage === 'compose' ? '' : 'hidden')}>
             <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
-              <div className="p-3 bg-slate-900/40 border border-slate-800 rounded-2xl">
+              <div className="p-4 bg-gradient-to-br from-slate-900/80 to-slate-950 border border-slate-800 rounded-3xl shadow-2xl">
+                <div className="flex items-start justify-between gap-3 mb-4">
+                  <div>
+                    <div className="text-[10px] font-black text-indigo-300 uppercase tracking-widest mb-1">录入模式</div>
+                    <p className="text-xs text-slate-500">{WORKFLOW_META[workflow].hint}</p>
+                  </div>
+                  <div className="hidden sm:block text-[10px] text-slate-600 font-bold">选择模板或直接输入</div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4">
+                  {(Object.keys(WORKFLOW_META) as IngestionMode[]).map((mode) => {
+                    const meta = WORKFLOW_META[mode];
+                    const Icon = meta.icon;
+                    const isActive = workflow === mode;
+                    return (
+                      <button key={mode} onClick={() => setWorkflow(mode)} className={clsx("text-left rounded-2xl border p-3 transition-all", isActive ? "border-indigo-500/50 bg-indigo-500/10 text-white" : "border-slate-800 bg-black/20 text-slate-400 hover:border-slate-700 hover:text-slate-200")}>
+                        <Icon className="w-4 h-4 mb-2 text-indigo-300" />
+                        <div className="text-xs font-black">{meta.label}</div>
+                        <div className="text-[10px] mt-1 leading-relaxed opacity-70">{meta.subtitle}</div>
+                      </button>
+                    );
+                  })}
+                </div>
                 <div className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2">输入任务模板库</div>
                 <div className="flex flex-wrap gap-2">
                   {INGESTION_TEMPLATES.map((template) => (
@@ -994,143 +1541,236 @@ export function InputSection() {
             </div>
           </div>
 
-          <div className={clsx("w-full md:w-[360px] lg:w-[420px] shrink-0 border-l border-slate-900 bg-slate-950 flex flex-col transition-all")}>
-            <div className="h-12 border-b border-slate-900 flex items-center justify-between px-4 shrink-0 bg-slate-900/20">
-              <div className="flex items-center gap-2">
-                <Layers3 className="w-4 h-4 text-indigo-400" />
-                <span className="text-[11px] font-black text-slate-300 uppercase tracking-widest">
-                  {selectedTask ? '任务详情' : '状态中心'}
-                </span>
-              </div>
-              {selectedTask && (
-                <button onClick={() => setSelectedTaskId(null)} className="text-[10px] text-slate-500 hover:text-indigo-400 font-bold uppercase tracking-widest">返回列表</button>
-              )}
-            </div>
-            
-            <div className="flex-1 overflow-y-auto custom-scrollbar p-4">
-              {!selectedTask ? (
-                // Task List View
-                <div className="space-y-3">
-                  {sortedTasks.length === 0 ? (
-                    <div className="h-full mt-24 flex items-center justify-center text-slate-700 text-[10px] font-black uppercase tracking-[0.2em] text-center">暂无运行或待处理的任务</div>
+          {activePage === 'history' && (
+            <div className="flex-1 grid grid-cols-1 xl:grid-cols-[380px_1fr] overflow-hidden bg-slate-950">
+              <div className="border-r border-slate-900 p-4 overflow-y-auto custom-scrollbar">
+                <div className="mb-4">
+                  <h3 className="text-sm font-black text-white">历史与状态</h3>
+                  <p className="text-xs text-slate-500 mt-1">任务状态、待确认结果和历史导入统一在这里处理。</p>
+                </div>
+                <div className="mb-5">
+                  <div className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2">解析任务</div>
+                  <div className="space-y-2">
+                    {sortedTasks.length === 0 ? (
+                      <div className="rounded-2xl border border-slate-800 bg-slate-900/30 p-4 text-xs text-slate-600">暂无运行或待确认任务</div>
+                    ) : (
+                      sortedTasks.map((task) => (
+                        <div
+                          key={task.id}
+                          onClick={() => { viewTask(task.id); setSelectedHistoryId(null); }}
+                          className={clsx("rounded-2xl border p-4 transition-all relative cursor-pointer", selectedTask?.id === task.id ? "border-indigo-500/50 bg-indigo-500/10" : "border-slate-800 bg-slate-900/40 hover:border-slate-700")}
+                        >
+                          {task.isNew && task.status === 'completed' && <div className="absolute top-3 right-3 w-2 h-2 bg-emerald-500 rounded-full shadow-[0_0_8px_rgba(16,185,129,1)]" />}
+                          <div className="flex items-center justify-between gap-3 mb-2">
+                            <span className="text-[9px] font-black uppercase text-indigo-300">{WORKFLOW_META[task.workflow].label}</span>
+                            <span className="text-[10px] font-bold text-slate-600">{new Date(task.createdAt).toLocaleTimeString()}</span>
+                          </div>
+                          <div className="text-sm text-slate-200 line-clamp-2">{task.inputExcerpt}</div>
+                          <div className="mt-3 flex items-center justify-between">
+                            {task.status === 'processing' && <span className="text-[10px] font-bold text-amber-400 flex items-center gap-1.5"><Loader2 className="w-3 h-3 animate-spin" />处理中</span>}
+                            {task.status === 'completed' && <span className="text-[10px] font-bold text-emerald-400 flex items-center gap-1.5"><Check className="w-3 h-3" />待确认</span>}
+                            {task.status === 'failed' && <span className="text-[10px] font-bold text-rose-400 flex items-center gap-1.5"><AlertCircle className="w-3 h-3" />失败</span>}
+                            {(task.status === 'completed' || task.status === 'failed') && (
+                              <button onClick={(event) => { event.stopPropagation(); setTasks(prev => prev.filter(t => t.id !== task.id)); }} className="text-slate-600 hover:text-rose-400 p-1"><Trash2 className="w-3.5 h-3.5" /></button>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-2">历史录入</div>
+                  {historyItems.length === 0 ? (
+                    <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6 text-center text-xs text-slate-600">暂无历史记录</div>
                   ) : (
-                    sortedTasks.map(task => (
-                      <div key={task.id} onClick={() => { if (task.status === 'completed') viewTask(task.id); }} className={clsx("bg-slate-900/60 border rounded-xl p-4 transition-all relative overflow-hidden", task.status === 'completed' ? "cursor-pointer hover:border-indigo-500/50" : "", task.isNew && task.status === 'completed' ? "border-emerald-500/50 shadow-[0_0_15px_rgba(16,185,129,0.1)]" : "border-slate-800")}>
-                        {task.isNew && task.status === 'completed' && <div className="absolute top-0 right-0 w-2 h-2 bg-emerald-500 rounded-full m-3 shadow-[0_0_8px_rgba(16,185,129,1)]" />}
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-[9px] font-black uppercase text-indigo-400">{WORKFLOW_META[task.workflow].label}</span>
-                          <span className="text-[10px] font-bold text-slate-500">{new Date(task.createdAt).toLocaleTimeString()}</span>
+                    historyItems.map((item) => (
+                      <button
+                        key={item.id}
+                        onClick={() => { setSelectedTaskId(null); setSelectedHistoryId(item.id); }}
+                        className={clsx("w-full text-left rounded-2xl border p-4 transition-all", !selectedTask && selectedHistoryItem?.id === item.id ? "border-indigo-500/50 bg-indigo-500/10" : "border-slate-800 bg-slate-900/40 hover:border-slate-700")}
+                      >
+                        <div className="flex items-center justify-between gap-3 mb-2">
+                          <span className="text-[9px] font-black uppercase text-indigo-300">{WORKFLOW_META[item.workflow]?.label || item.workflow}</span>
+                          <span className="text-[10px] font-bold text-slate-600">{new Date(item.timestamp).toLocaleString()}</span>
                         </div>
-                        <div className="text-xs text-slate-300 font-sans line-clamp-2 leading-relaxed mb-3">{task.inputExcerpt}</div>
-                        <div className="flex items-center justify-between mt-auto">
-                          {task.status === 'processing' && (
-                            <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-500">
-                              <Loader2 className="w-3 h-3 animate-spin"/>
-                              {task.retryCount && task.retryCount > 0 ? `重试中 (${task.retryCount}/${task.maxRetries || maxAutoRetries})` : '处理中...'}
-                            </div>
-                          )}
-                          {task.status === 'completed' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-500"><Check className="w-3 h-3"/> 处理完成，点击查看</div>}
-                          {task.status === 'failed' && <div className="flex items-center gap-1.5 text-[10px] font-bold text-rose-500"><AlertCircle className="w-3 h-3"/> 解析失败 {task.diagnostic ? `(${task.diagnostic.title})` : ''}</div>}
-                          
-                          {(task.status === 'completed' || task.status === 'failed') && (
-                            <button onClick={(e) => { e.stopPropagation(); setTasks(prev => prev.filter(t => t.id !== task.id)); }} className="text-slate-600 hover:text-rose-400 p-1"><Trash2 className="w-3.5 h-3.5" /></button>
-                          )}
-                        </div>
-                      </div>
+                        <div className="text-sm text-slate-200 line-clamp-2">{toDisplayText(item.input) || `素材录入（${item.images?.length || 0} 个附件）`}</div>
+                        <div className="mt-2 text-[10px] text-slate-500">{item.parsedItems?.length || 0} 条解析结果</div>
+                      </button>
                     ))
                   )}
                 </div>
-              ) : (
-                // Task Detail View
-                <div className="space-y-4">
-                  {selectedTask.status === 'failed' ? (
-                     <div className="space-y-3">
-                       <div className="text-rose-400 text-xs p-4 bg-rose-500/10 rounded-xl border border-rose-500/20">{selectedTask.error}</div>
-                       {selectedTask.diagnostic && (
-                         <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-2">
-                           <div className="text-xs font-bold text-slate-200 flex items-center gap-2">
-                             {selectedTask.diagnostic.category === 'network' && <WifiOff className="w-4 h-4 text-amber-400" />}
-                             {selectedTask.diagnostic.category === 'auth' && <KeyRound className="w-4 h-4 text-rose-400" />}
-                             {selectedTask.diagnostic.category === 'rate_limit' && <Gauge className="w-4 h-4 text-indigo-400" />}
-                             {selectedTask.diagnostic.category === 'unknown' && <AlertTriangle className="w-4 h-4 text-slate-400" />}
-                             诊断：{selectedTask.diagnostic.title}
-                           </div>
-                           <p className="text-xs text-slate-400">{selectedTask.diagnostic.hint}</p>
-                         </div>
-                       )}
-                     </div>
-                  ) : selectedTask.pendingReview ? (
-                    <>
-                      <div className="flex items-center justify-between gap-2 p-3 bg-slate-900/40 border border-slate-800 rounded-xl">
-                        <div className="text-[11px] text-slate-400">这次解析结果是否有帮助？你的反馈会直接影响后续提示词策略。</div>
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => handleTaskFeedback(selectedTask.id, 'helpful')}
-                            disabled={!!selectedTask.feedbackStatus}
-                            className={clsx(
-                              'px-3 py-1.5 rounded-lg text-xs transition-colors',
-                              selectedTask.feedbackStatus === 'helpful'
-                                ? 'bg-emerald-600 text-white'
-                                : 'bg-slate-800 hover:bg-emerald-600/80 text-slate-200 disabled:opacity-50'
-                            )}
-                          >
-                            <CheckCircle2 className="w-3 h-3 inline-block mr-1" />
-                            有用
-                          </button>
-                          <button
-                            onClick={() => handleTaskFeedback(selectedTask.id, 'inaccurate')}
-                            disabled={!!selectedTask.feedbackStatus}
-                            className={clsx(
-                              'px-3 py-1.5 rounded-lg text-xs transition-colors',
-                              selectedTask.feedbackStatus === 'inaccurate'
-                                ? 'bg-rose-600 text-white'
-                                : 'bg-slate-800 hover:bg-rose-600/80 text-slate-200 disabled:opacity-50'
-                            )}
-                          >
-                            不准
-                          </button>
-                        </div>
-                      </div>
-                      {selectedTask.pendingReview.aiAnalysis && <div className="bg-indigo-500/5 border-l-4 border-l-indigo-500 p-3 text-[11px] text-slate-400 leading-relaxed"><Markdown>{selectedTask.pendingReview.aiAnalysis}</Markdown></div>}
-                      {selectedTask.pendingReview.parsedItems.map((item, idx) => (
-                        <div key={idx} className="bg-slate-900/40 border border-slate-800 rounded-xl p-4 hover:border-emerald-500/30 transition-all font-sans relative">
-                          <div className="absolute top-2 right-2"><button onClick={() => {
-                            if (!selectedTask.pendingReview) return;
-                            const newItems = selectedTask.pendingReview.parsedItems.filter((_, i) => i !== idx);
-                            setTasks(prev => prev.map(t => t.id === selectedTask.id ? { ...t, pendingReview: { ...t.pendingReview!, parsedItems: newItems } } : t));
-                          }} className="p-1 text-slate-700 hover:text-rose-400"><Trash2 className="w-4 h-4" /></button></div>
-                          <div className={clsx("inline-block px-1.5 py-0.5 rounded text-[8px] font-black uppercase mb-3", item.isMistake ? "bg-rose-500/20 text-rose-400" : "bg-emerald-500/20 text-emerald-400")}>{item.isMistake ? 'MISTAKE' : 'KNOWLEDGE'}</div>
-                          <div className="prose prose-invert prose-sm text-slate-200 text-[13px]"><Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{item.content}</Markdown></div>
-                        </div>
-                      ))}
-                    </>
-                  ) : null}
-                </div>
-              )}
-            </div>
-            
-            {selectedTask && selectedTask.status === 'completed' && selectedTask.pendingReview && (
-              <div className="p-4 border-t border-slate-900 bg-slate-950">
-                <button onClick={() => persistParsedItems(selectedTask)} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-black shadow-xl active:scale-95 transition-all">确认并保存 {selectedTask.pendingReview.parsedItems.length} 项</button>
               </div>
-            )}
-          </div>
 
-          {showHistory && (
-            <div className="absolute inset-0 z-50 bg-slate-950/98 backdrop-blur-xl p-4 sm:p-8 flex flex-col">
-              <div className="max-w-3xl mx-auto w-full h-full flex flex-col">
-                <div className="flex items-center justify-between mb-8"><div className="flex items-center gap-2"><History className="w-5 h-5 text-indigo-400" /><h2 className="text-sm font-black text-white uppercase tracking-widest">录入历史</h2></div><button onClick={() => setShowHistory(false)} className="p-2 text-slate-500 hover:text-white"><X className="w-6 h-6" /></button></div>
-                <div className="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-2">
-                  {state.inputHistory.length === 0 ? <p className="text-center text-slate-600 py-12 text-xs">暂无历史记录</p> : 
-                    [...state.inputHistory].reverse().map(item => (
-                      <div key={item.id} onClick={() => restoreHistoryItem(item)} className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 hover:border-indigo-500/50 transition-all cursor-pointer group">
-                        <div className="flex justify-between items-center mb-2"><span className="text-[10px] font-bold text-slate-600">{new Date(item.timestamp).toLocaleString()}</span><span className="text-[9px] font-black text-indigo-400 uppercase">{item.workflow}</span></div>
-                        <div className="text-sm text-slate-300 line-clamp-1 mb-1 font-sans">{toDisplayText(item.input) || '素材录入'}</div>
-                        <div className="text-[10px] font-bold text-slate-600 group-hover:text-indigo-400">点击恢复 →</div>
+              <div className="p-4 sm:p-6 overflow-y-auto custom-scrollbar">
+                {selectedTask ? (
+                  <div className="max-w-4xl mx-auto space-y-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[10px] font-black uppercase tracking-widest text-indigo-300 mb-1">{WORKFLOW_META[selectedTask.workflow].label}</div>
+                        <h3 className="text-lg font-black text-white">{selectedTask.status === 'failed' ? '任务失败' : '任务详情'}</h3>
                       </div>
-                    ))
-                  }
-                </div>
+                      <button onClick={() => setSelectedTaskId(null)} className="text-[10px] text-slate-500 hover:text-indigo-400 font-bold uppercase tracking-widest">查看历史</button>
+                    </div>
+
+                    {selectedTask.status === 'processing' ? (
+                      <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-6 text-sm text-amber-100 flex items-center gap-3">
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        正在解析中，完成后会在这里显示待确认结果。
+                      </div>
+                    ) : selectedTask.status === 'failed' ? (
+                      <div className="space-y-3">
+                        <div className="text-rose-400 text-xs p-4 bg-rose-500/10 rounded-xl border border-rose-500/20">{selectedTask.error}</div>
+                        {selectedTask.diagnostic && (
+                          <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl space-y-2">
+                            <div className="text-xs font-bold text-slate-200 flex items-center gap-2">
+                              {selectedTask.diagnostic.category === 'network' && <WifiOff className="w-4 h-4 text-amber-400" />}
+                              {selectedTask.diagnostic.category === 'auth' && <KeyRound className="w-4 h-4 text-rose-400" />}
+                              {selectedTask.diagnostic.category === 'rate_limit' && <Gauge className="w-4 h-4 text-indigo-400" />}
+                              {selectedTask.diagnostic.category === 'unknown' && <AlertTriangle className="w-4 h-4 text-slate-400" />}
+                              诊断：{selectedTask.diagnostic.title}
+                            </div>
+                            <p className="text-xs text-slate-400">{selectedTask.diagnostic.hint}</p>
+                          </div>
+                        )}
+                      </div>
+                    ) : selectedTask.pendingReview ? (
+                      <>
+                        <div className="flex items-center justify-between gap-2 p-3 bg-slate-900/40 border border-slate-800 rounded-xl">
+                          <div className="text-[11px] text-slate-400">这次解析结果是否有帮助？你的反馈会直接影响后续提示词策略。</div>
+                          <div className="flex gap-2">
+                            <button onClick={() => handleTaskFeedback(selectedTask.id, 'helpful')} disabled={selectedTask.feedbackStatus === 'helpful'} className={clsx('px-3 py-1.5 rounded-lg text-xs transition-colors', selectedTask.feedbackStatus === 'helpful' ? 'bg-emerald-600 text-white' : 'bg-slate-800 hover:bg-emerald-600/80 text-slate-200 disabled:opacity-50')}>
+                              <CheckCircle2 className="w-3 h-3 inline-block mr-1" />有用
+                            </button>
+                            <button onClick={() => handleTaskFeedback(selectedTask.id, 'inaccurate')} disabled={selectedTask.feedbackStatus === 'inaccurate' && !selectedTask.feedbackTag} className={clsx('px-3 py-1.5 rounded-lg text-xs transition-colors', selectedTask.feedbackStatus === 'inaccurate' ? 'bg-rose-600 text-white' : 'bg-slate-800 hover:bg-rose-600/80 text-slate-200 disabled:opacity-50')}>
+                              不准
+                            </button>
+                          </div>
+                        </div>
+                        {selectedTask.pendingReview.aiAnalysis && <div className="bg-indigo-500/5 border-l-4 border-l-indigo-500 p-3 text-[11px] text-slate-400 leading-relaxed"><Markdown>{selectedTask.pendingReview.aiAnalysis}</Markdown></div>}
+                        {selectedTask.feedbackStatus === 'inaccurate' && (
+                          <div className="flex flex-wrap gap-2 rounded-xl border border-rose-500/20 bg-rose-500/5 p-3 text-[10px] text-rose-100">
+                            <span className="mr-1 text-slate-400">问题标签：</span>
+                            {FEEDBACK_QUICK_TAGS.map((tag) => (
+                              <button
+                                key={`${selectedTask.id}-${tag}`}
+                                onClick={() => handleTaskFeedback(selectedTask.id, 'inaccurate', tag)}
+                                className={clsx(
+                                  'rounded-full border px-2 py-1 text-rose-100 transition-colors',
+                                  selectedTask.feedbackTag === tag
+                                    ? 'border-rose-400 bg-rose-500/15'
+                                    : 'border-rose-500/30 bg-slate-950 hover:bg-rose-500/10'
+                                )}
+                              >
+                                {tag}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {selectedTask.pendingReview.parsedItems.map((item, idx) => {
+                          const evaluation = selectedTaskReviewEvaluations[idx];
+                          const anchorPreview = selectedTaskAnchorPreviews[idx];
+                          return (
+                            <div key={idx} className={clsx("bg-slate-900/40 border rounded-xl p-4 transition-all font-sans relative", evaluation?.eligible ? "border-slate-800 hover:border-emerald-500/30" : "border-amber-500/30 hover:border-amber-400/50")}>
+                              <div className="absolute top-2 right-2"><button onClick={() => {
+                                if (!selectedTask.pendingReview) return;
+                                const newItems = selectedTask.pendingReview.parsedItems.filter((_, i) => i !== idx);
+                                setTasks(prev => prev.map(t => t.id === selectedTask.id ? { ...t, pendingReview: { ...t.pendingReview!, parsedItems: newItems } } : t));
+                              }} className="p-1 text-slate-700 hover:text-rose-400"><Trash2 className="w-4 h-4" /></button></div>
+                              <div className="flex flex-wrap items-center gap-1.5 pr-7 mb-3">
+                                <div className={clsx("inline-block px-1.5 py-0.5 rounded text-[8px] font-black uppercase", item.isMistake ? "bg-rose-500/20 text-rose-400" : "bg-emerald-500/20 text-emerald-400")}>{item.isMistake ? 'MISTAKE' : 'KNOWLEDGE'}</div>
+                                {item.questionNo && <div className="px-1.5 py-0.5 rounded bg-slate-800 text-[8px] font-black text-slate-300">Q{item.questionNo}</div>}
+                                {typeof evaluation?.score === 'number' && <div className={clsx("px-1.5 py-0.5 rounded text-[8px] font-black", evaluation.eligible ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300")}>质量 {evaluation.score}</div>}
+                                {item.needsConfirmation && <div className="px-1.5 py-0.5 rounded bg-amber-500/15 text-[8px] font-black text-amber-300">待确认</div>}
+                                {item.conflict && <div className="px-1.5 py-0.5 rounded bg-rose-500/15 text-[8px] font-black text-rose-300">冲突</div>}
+                              </div>
+                              {anchorPreview && (
+                                <div className={clsx(
+                                  'mb-3 rounded-lg border p-2 text-[10px] leading-relaxed',
+                                  anchorPreview.status === 'ok'
+                                    ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100'
+                                    : 'border-rose-500/20 bg-rose-500/10 text-rose-100'
+                                )}>
+                                  <div className="font-semibold">
+                                    挂载路径：{anchorPreview.path || '未确定'}
+                                  </div>
+                                  <div className="mt-1">
+                                    {anchorPreview.status === 'ok'
+                                      ? `${anchorPreview.note}${anchorPreview.createdNodes.length > 0 ? `，将补充 ${anchorPreview.createdNodes.length} 个层级节点` : ''}`
+                                      : `拦截原因：${anchorPreview.reason || '未通过导图挂载规则'}`}
+                                  </div>
+                                </div>
+                              )}
+                              <div className="prose prose-invert prose-sm text-slate-200 text-[13px]"><Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{item.content}</Markdown></div>
+                              {(item.studentAnswer || item.correctAnswer || item.errorReason) && (
+                                <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+                                  {item.studentAnswer && <div>学生答案：<span className="text-slate-200">{item.studentAnswer}</span></div>}
+                                  {item.correctAnswer && <div>正确答案：<span className="text-slate-200">{item.correctAnswer}</span></div>}
+                                  {item.errorReason && <div>错因：{item.errorReasonCategory ? `【${item.errorReasonCategory}】` : ''}{item.errorReason}</div>}
+                                  {item.evidence?.sourceText && <div>证据：{item.evidence.sourceText}</div>}
+                                  {item.learningTask && <div>复习任务：{item.learningTask}</div>}
+                                </div>
+                              )}
+                              {!evaluation?.eligible && evaluation?.flags.length > 0 && (
+                                <div className="mt-3 rounded-lg bg-amber-500/10 border border-amber-500/20 p-2 text-[10px] leading-relaxed text-amber-200">
+                                  待确认原因：{evaluation.flags.join('、')}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        <div className="sticky bottom-0 pt-2 bg-slate-950/95">
+                          <button onClick={() => persistParsedItems(selectedTask)} className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-black shadow-xl active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed" disabled={selectedTaskSaveStats.approved === 0}>
+                            {selectedTaskSaveStats.approved > 0
+                              ? `保存 ${selectedTaskSaveStats.approved} 条正式记忆，保留 ${selectedTaskSaveStats.pending} 条待确认`
+                              : `暂无可正式入库项，保留 ${selectedTaskSaveStats.pending} 条待确认`}
+                          </button>
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                ) : selectedHistoryItem ? (
+                  <div className="max-w-4xl mx-auto space-y-4">
+                    <div className="rounded-3xl border border-slate-800 bg-slate-900/50 p-5">
+                      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+                        <div>
+                          <div className="text-[10px] font-black uppercase tracking-widest text-indigo-300 mb-2">{WORKFLOW_META[selectedHistoryItem.workflow]?.label || selectedHistoryItem.workflow}</div>
+                          <h3 className="text-lg font-black text-white">历史导入详情</h3>
+                          <p className="text-xs text-slate-500 mt-1">{new Date(selectedHistoryItem.timestamp).toLocaleString()} · {selectedHistoryItem.identifiedSubject || selectedHistoryItem.subject}</p>
+                        </div>
+                        <button onClick={() => restoreHistoryItem(selectedHistoryItem)} className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-black transition-colors">
+                          编辑并重新导入
+                        </button>
+                      </div>
+                      {selectedHistoryItem.input && <div className="mt-4 rounded-2xl bg-black/30 border border-slate-800 p-4 text-sm text-slate-300 whitespace-pre-wrap">{selectedHistoryItem.input}</div>}
+                    </div>
+
+                    {selectedHistoryItem.aiAnalysis && (
+                      <div className="rounded-2xl border border-indigo-500/20 bg-indigo-500/5 p-4 text-xs text-slate-300 leading-relaxed">
+                        <Markdown>{selectedHistoryItem.aiAnalysis}</Markdown>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {(selectedHistoryItem.parsedItems || []).map((rawItem, index) => {
+                        const item = normalizeReviewItem(rawItem);
+                        return (
+                          <div key={index} className="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+                            <div className="flex items-center gap-2 mb-2">
+                              <span className={clsx("px-1.5 py-0.5 rounded text-[8px] font-black uppercase", item.isMistake ? "bg-rose-500/20 text-rose-300" : "bg-emerald-500/20 text-emerald-300")}>{item.isMistake ? 'MISTAKE' : item.type || 'ITEM'}</span>
+                              {item.questionNo && <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[8px] font-black text-slate-300">Q{item.questionNo}</span>}
+                            </div>
+                            <div className="prose prose-invert prose-sm text-slate-200 text-[13px]"><Markdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>{item.content}</Markdown></div>
+                            {item.learningTask && <div className="mt-2 text-[11px] text-indigo-200">复习任务：{item.learningTask}</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="h-full flex items-center justify-center text-xs text-slate-600">选择一条历史记录查看详情</div>
+                )}
               </div>
             </div>
           )}

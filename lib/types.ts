@@ -13,7 +13,7 @@ export type ResourceOrigin =
   | 'resource_import'
   | 'derived';
 export type ResourceRetentionPolicy = 'keep' | 'auto' | 'manual';
-export type FeedbackTargetType = 'memory' | 'chat' | 'ingestion' | 'resource' | 'profile';
+export type FeedbackTargetType = 'memory' | 'chat' | 'ingestion' | 'graph' | 'resource' | 'profile';
 export type FeedbackSignalType =
   | 'workflow_used'
   | 'ingestion_regenerated'
@@ -22,8 +22,20 @@ export type FeedbackSignalType =
   | 'memory_promoted'
   | 'chat_helpful'
   | 'chat_inaccurate'
+  | 'graph_helpful'
+  | 'graph_inaccurate'
   | 'resource_pinned'
   | 'preference_note';
+export type KnowledgeNodeKind = 'root' | 'module' | 'topic' | 'knowledge' | 'method';
+export type AIPreset = 'quality' | 'balanced' | 'advanced';
+
+export interface GraphScope {
+  nodeId: string | null;
+  subject: Subject;
+  includeDescendants: boolean;
+  includeRelated: boolean;
+  updatedAt: number;
+}
 
 export interface FSRSData {
   due: number; // timestamp
@@ -37,6 +49,17 @@ export interface FSRSData {
   state: number;
 }
 
+export interface MemoryEvidence {
+  sourceText?: string;
+  locationHint?: string;
+  keySentence?: string;
+}
+
+export interface MemoryCard {
+  front?: string;
+  back?: string;
+}
+
 export interface Memory {
   id: string;
   subject: Subject;
@@ -46,7 +69,9 @@ export interface Memory {
   region?: string; // e.g., 'Beijing', 'National Paper 1'
   content: string; // Question stem or knowledge point
   correctAnswer?: string; // Standard answer
+  questionNo?: string;
   questionType?: string; // e.g., 'multiple-choice', 'fill-in-the-blank', 'essay'
+  studentAnswer?: string;
   source?: string; // e.g., '2023 Midterm Exam'
   sourceTextbookId?: string;
   sourceTextbookPage?: number;
@@ -75,6 +100,15 @@ export interface Memory {
   visualDescription?: string;
   visualDescriptions?: string[];
   analysisProcess?: string;
+  needsConfirmation?: boolean;
+  conflict?: boolean;
+  errorReasonCategory?: string;
+  evidence?: MemoryEvidence;
+  optionAnalysis?: Record<string, string>;
+  learningTask?: string;
+  transferExercises?: string[];
+  memoryCard?: MemoryCard;
+  reviewPriority?: 'high' | 'medium' | 'low' | 'summary_only';
   fsrs?: FSRSData;
   embedding?: number[]; // For RAG
   type?: 'concept' | 'qa' | 'vocabulary';
@@ -86,6 +120,8 @@ export interface Memory {
     usage?: string;
     mnemonics?: string;
     synonyms?: string[];
+    originalSentence?: string;
+    confusions?: string[];
   };
 }
 
@@ -95,6 +131,7 @@ export interface KnowledgeNode {
   version?: number;
   status?: 'active' | 'archived' | 'deleted';
   dataSource?: 'manual' | 'ai_parse' | 'ai_chat' | 'mistake_analysis' | 'textbook_extract' | 'import' | 'system';
+  kind?: KnowledgeNodeKind;
   name: string;
   parentId: string | null;
   order: number; // Order within siblings
@@ -218,6 +255,7 @@ export interface CustomModel {
 }
 
 export interface Settings {
+  aiPreset?: AIPreset;
   parseModel: string;
   chatModel: string;
   graphModel: string;
@@ -278,11 +316,106 @@ export interface AILog {
   metadata?: Record<string, unknown>;
 }
 
+export interface TextbookAnnotationBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface TextbookAnnotation {
+  id: string;
+  pageNumber: number;
+  type: 'highlight' | 'note' | 'memory' | 'focus' | 'review';
+  text?: string;
+  note?: string;
+  color?: string;
+  createdAt: number;
+  updatedAt?: number;
+  startOffset?: number;
+  endOffset?: number;
+  sectionId?: string;
+  tags?: string[];
+  box?: TextbookAnnotationBox;
+}
+
+export interface TextbookTOCItem {
+  id: string;
+  title: string;
+  level: number;
+  startPage: number;
+  endPage: number;
+  confidence: number;
+  children: TextbookTOCItem[];
+  summary?: string;
+  highlight?: 'normal' | 'focus' | 'needs_review';
+}
+
+export interface TextbookGraphNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  order: number;
+  level: number;
+  confidence: number;
+  kind: 'chapter' | 'section' | 'topic' | 'knowledge';
+  startPage?: number;
+  endPage?: number;
+  sourceSectionId?: string;
+}
+
+export interface TextbookSectionStudyStats {
+  sectionId: string;
+  mastery: number;
+  readPages: number;
+  annotationCount: number;
+  quizCount: number;
+  status: 'new' | 'studying' | 'reviewing' | 'mastered';
+  lastVisitedAt?: number;
+}
+
+export interface TextbookStudyStats {
+  lastOpenedPage?: number;
+  lastOpenedSectionId?: string;
+  readPageNumbers: number[];
+  totalAnnotations: number;
+  totalHighlights: number;
+  totalQuizCount: number;
+  sectionProgress: Record<string, TextbookSectionStudyStats>;
+}
+
+export interface TextbookQuizConfig {
+  scopeType: 'chapter' | 'section' | 'custom';
+  sectionId?: string;
+  pageRange?: {
+    start: number;
+    end: number;
+  };
+  depth: 'basic' | 'standard' | 'deep';
+  adaptive: boolean;
+  questionTypes: Array<'single_choice' | 'true_false'>;
+}
+
+export interface TextbookQuizQuestion {
+  id: string;
+  type: 'single_choice' | 'true_false';
+  prompt: string;
+  options?: string[];
+  answer: string;
+  explanation?: string;
+  relatedPageNumbers?: number[];
+  relatedSectionIds?: string[];
+  source: 'textbook' | 'hybrid';
+}
+
 export interface TextbookPage {
   id: string;
   pageNumber: number;
   content: string;
   imageUrl: string;
+  confidence?: number;
+  sectionIds?: string[];
+  annotations?: TextbookAnnotation[];
   embedding?: number[];
 }
 
@@ -298,6 +431,11 @@ export interface Textbook {
   totalPages?: number;
   pages: TextbookPage[]; // Cached pages or pre-rendered pages
   framework?: KnowledgeNode[]; // AI generated framework
+  processingStatus?: 'uploading' | 'processing' | 'ready' | 'needs_review' | 'failed';
+  toc?: TextbookTOCItem[];
+  textbookGraph?: TextbookGraphNode[];
+  studyStats?: TextbookStudyStats;
+  entryMode?: 'result' | 'workspace';
   createdAt: number;
   updatedAt?: number;
   deletedAt?: number;
@@ -409,6 +547,7 @@ export interface AppState {
   reviewEvents: ReviewEvent[];
   fsrsProfiles: FSRSProfile[];
   retrievalIndex: RetrievalIndexState;
+  activeGraphScope: GraphScope;
   settings: Settings;
   lastSynced?: number;
   logs: AILog[];
@@ -417,6 +556,7 @@ export interface AppState {
   inputHistory: InputHistoryItem[];
   draftInput?: string;
   draftImages?: string[];
+  draftChatQuery?: string;
   draftGraphProposal?: { reasoning: string; operations: any[] } | null;
   resources: Resource[];
   syncConflicts: SyncMemoryConflict[];
@@ -424,6 +564,7 @@ export interface AppState {
 
 export type Action =
   | { type: 'SET_SUBJECT'; payload: Subject }
+  | { type: 'SET_ACTIVE_GRAPH_SCOPE'; payload: Partial<GraphScope> | null }
   | { type: 'ADD_MEMORY'; payload: Memory }
   | { type: 'UPDATE_MEMORY'; payload: Memory }
   | { type: 'DELETE_MEMORY'; payload: string }
@@ -468,7 +609,7 @@ export type Action =
   | { type: 'DELETE_SUBJECT_NODES'; payload: { subject: Subject } }
   | { type: 'DELETE_SUBJECT_MISTAKES'; payload: { subject: Subject } }
   | { type: 'DELETE_SUBJECT_TEXTBOOKS'; payload: { subject: Subject } }
-  | { type: 'UPDATE_DRAFT'; payload: { draftInput?: string; draftImages?: string[]; draftGraphProposal?: { reasoning: string; operations: any[] } | null; } }
+  | { type: 'UPDATE_DRAFT'; payload: { draftInput?: string; draftImages?: string[]; draftChatQuery?: string; draftGraphProposal?: { reasoning: string; operations: any[] } | null; } }
   | { type: 'ADD_RESOURCE'; payload: Resource }
   | { type: 'BATCH_ADD_RESOURCES'; payload: Resource[] }
   | { type: 'UPDATE_RESOURCE'; payload: Resource }

@@ -3,6 +3,7 @@ import { normalizeInputHistoryItems } from './input-history';
 import { buildPromptOptimizationNotes } from './prompting';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+export const FEEDBACK_QUICK_TAGS = ['挂错节点', '检索不准', '回答跑偏', '解释太浅', '速度太慢'] as const;
 
 function pluralizeWorkflow(workflow: string) {
   if (workflow === 'image_pro') return '图片专业处理';
@@ -19,6 +20,7 @@ export function buildFeedbackLearningNotes(events: UserFeedbackEvent[], logs: AI
   const recentEvents = (events || []).slice(0, 200);
   const counts = new Map<string, number>();
   const workflows = new Map<string, number>();
+  const quickTags = new Map<string, number>();
   const notes = new Set<string>();
 
   for (const event of recentEvents) {
@@ -27,6 +29,11 @@ export function buildFeedbackLearningNotes(events: UserFeedbackEvent[], logs: AI
     const workflow = typeof event.metadata?.workflow === 'string' ? event.metadata.workflow : undefined;
     if (workflow) {
       workflows.set(workflow, (workflows.get(workflow) || 0) + 1);
+    }
+
+    const quickTag = typeof event.metadata?.feedbackTag === 'string' ? event.metadata.feedbackTag : undefined;
+    if (quickTag) {
+      quickTags.set(quickTag, (quickTags.get(quickTag) || 0) + 1);
     }
 
     const note = event.note?.trim();
@@ -64,6 +71,23 @@ export function buildFeedbackLearningNotes(events: UserFeedbackEvent[], logs: AI
 
   if ((counts.get('resource_pinned') || 0) >= 1) {
     lines.push('被固定保存的图片或资料通常是高价值样本，后续优化时应优先参考这些资料的格式与信息密度。');
+  }
+
+  const sortedTags = Array.from(quickTags.entries()).sort((left, right) => right[1] - left[1]);
+  if (sortedTags.length > 0) {
+    lines.push(`高频负反馈标签：${sortedTags.slice(0, 3).map(([tag, count]) => `${tag}(${count})`).join('、')}。`);
+  }
+  if ((quickTags.get('挂错节点') || 0) >= 2) {
+    lines.push('导图挂载要优先复用当前节点与已有子树；如果父级不明确，应直接拦截等待确认。');
+  }
+  if ((quickTags.get('检索不准') || 0) >= 2) {
+    lines.push('问答检索应先按当前导图范围收窄，再做混合召回，避免跨主题记忆污染答案。');
+  }
+  if ((quickTags.get('回答跑偏') || 0) >= 2 || (quickTags.get('解释太浅') || 0) >= 2) {
+    lines.push('回答应围绕当前节点路径给出“结论 + 关键依据 + 易错点/方法”，减少泛泛铺陈。');
+  }
+  if ((quickTags.get('速度太慢') || 0) >= 2) {
+    lines.push('优先保持 hybrid-only 检索链路，避免额外 rerank 或 late interaction 增加时延。');
   }
 
   if (notes.size > 0) {

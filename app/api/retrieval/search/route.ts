@@ -12,6 +12,12 @@ import { fetchLateDocuments, searchDense, searchSparse } from '@/lib/retrieval/q
 import { buildQuerySparseWeights, toQdrantSparseVector } from '@/lib/retrieval/sparse';
 import type { RetrievalDocument, RetrievalFusionMode, RetrievalHit, RetrievalRerankMode, Settings } from '@/lib/types';
 
+type RerankResult = {
+  id: string;
+  score: number;
+  reason?: string;
+};
+
 export const runtime = 'edge';
 export const maxDuration = 30;
 
@@ -85,6 +91,9 @@ export async function POST(req: NextRequest) {
     const syncKey = req.headers.get('X-Sync-Key')?.trim() || body?.syncKey?.trim();
     const query = String(body?.query || '').trim();
     const subject = typeof body?.subject === 'string' ? body.subject : undefined;
+    const nodeIds = Array.isArray(body?.nodeIds)
+      ? body.nodeIds.filter((value: unknown): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
     const settings = (body?.settings || {}) as Settings;
     const recallTopK = Math.max(5, Math.min(100, Number(body?.recallTopK || settings.recallTopK || 40)));
     const rerankTopN = Math.max(1, Math.min(30, Number(body?.rerankTopN || settings.rerankTopN || 10)));
@@ -165,12 +174,14 @@ export async function POST(req: NextRequest) {
     } else if (rerankMode === 'cross-encoder') {
       const rerankerProvider = settings.rerankerProvider || resolveProviderFromEnv('RERANKER');
       if (hasRetrievalProvider(rerankerProvider)) {
-        const reranked = await rerankWithProvider(
+        const reranked: RerankResult[] = await rerankWithProvider(
           rerankerProvider!,
           query,
           hits.map((hit) => ({ id: hit.id, text: hit.document.text }))
         );
-        const rerankMap = new Map(reranked.map((item) => [item.id, item]));
+        const rerankMap = new Map<string, RerankResult>(
+          reranked.map((item: RerankResult) => [item.id, item])
+        );
         hits = hits
           .map((hit) => {
             const rerank = rerankMap.get(hit.id);
@@ -190,7 +201,11 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    return NextResponse.json({ hits, mode, warnings });
+    const filteredHits = nodeIds.length > 0
+      ? hits.filter((hit) => hit.document.kind !== 'memory' || hit.document.nodeIds.some((id) => nodeIds.includes(id)))
+      : hits;
+
+    return NextResponse.json({ hits: filteredHits, mode, warnings });
   } catch (error: any) {
     return NextResponse.json({ error: error?.message || 'retrieval search failed' }, { status: 500 });
   }

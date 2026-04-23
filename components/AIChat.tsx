@@ -1,9 +1,9 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useAppContext } from '@/lib/store';
-import { chatWithAI, searchMemoriesRAG, reorganizeMemories, extractMemoryFromChat, generateGatewaySummary } from '@/lib/ai';
-import { Send, Bot, User, Loader2, X, Image as ImageIcon, UploadCloud, Search, Sparkles, Database, RefreshCw, Wand2, ThumbsUp, ThumbsDown } from 'lucide-react';
+import { chatWithAI, searchMemoriesRAG, reorganizeMemories, extractMemoryFromChat, generateGatewaySummary, inferModelProvider, resolveAIPresetSettings } from '@/lib/ai';
+import { Send, Bot, User, Loader2, X, Image as ImageIcon, UploadCloud, Search, Sparkles, Database, RefreshCw, Wand2, ThumbsUp, ThumbsDown, Target, GitBranch } from 'lucide-react';
 import { clsx } from 'clsx';
 import Markdown from 'react-markdown';
 import remarkMath from 'remark-math';
@@ -11,7 +11,8 @@ import rehypeKatex from 'rehype-katex';
 import { v4 as uuidv4 } from 'uuid';
 import { ModelSelector } from '@/components/ModelSelector';
 import { createMemoryPayload } from '@/lib/data/commands';
-import { getAutoExpireAt } from '@/lib/feedback';
+import { FEEDBACK_QUICK_TAGS, getAutoExpireAt } from '@/lib/feedback';
+import { buildKnowledgeNodePath, getGraphScopeNodeIds, getMemoriesForGraphScope, getRelatedKnowledgeNodes } from '@/lib/data/quality';
 
 import { TextbookPagePreview } from './TextbookPagePreview';
 
@@ -21,6 +22,7 @@ interface Message {
   content: string;
   image?: string;
   feedback?: 'helpful' | 'inaccurate';
+  feedbackTag?: string;
 }
 
 function renderMessageContent(content: string) {
@@ -38,6 +40,31 @@ function renderMessageContent(content: string) {
 
 export function AIChat() {
   const { state, dispatch } = useAppContext();
+  const effectiveSettings = useMemo(() => resolveAIPresetSettings(state.settings), [state.settings]);
+  const subjectNodes = useMemo(
+    () => state.knowledgeNodes.filter((node) => node.subject === state.currentSubject),
+    [state.currentSubject, state.knowledgeNodes]
+  );
+  const subjectMemories = useMemo(
+    () => state.memories.filter((memory) => memory.subject === state.currentSubject),
+    [state.currentSubject, state.memories]
+  );
+  const activeScope =
+    state.activeGraphScope?.nodeId && state.activeGraphScope.subject === state.currentSubject
+      ? state.activeGraphScope
+      : null;
+  const scopePath = useMemo(
+    () => buildKnowledgeNodePath(subjectNodes, activeScope?.nodeId).map((node) => node.name).join(' / '),
+    [activeScope?.nodeId, subjectNodes]
+  );
+  const scopeNodeIds = useMemo(
+    () => getGraphScopeNodeIds(subjectNodes, activeScope),
+    [activeScope, subjectNodes]
+  );
+  const relatedScopeNodeIds = useMemo(() => {
+    if (!activeScope?.nodeId) return [];
+    return getRelatedKnowledgeNodes(subjectNodes, subjectMemories, activeScope.nodeId, 5).map((item) => item.node.id);
+  }, [activeScope, subjectMemories, subjectNodes]);
   const [messages, setMessages] = useState<Message[]>([
     { id: '1', role: 'ai', content: `你好！我是你的${state.currentSubject} AI辅导老师。有什么问题可以随时问我，我会结合你的记忆库为你解答。` }
   ]);
@@ -52,12 +79,13 @@ export function AIChat() {
   const [enableRAG, setEnableRAG] = useState(true);
   const [isReorganizing, setIsReorganizing] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(state.settings.chatModel);
+  const [selectedModel, setSelectedModel] = useState(effectiveSettings.chatModel);
 
   const addFeedback = (
     targetId: string,
     signalType: 'chat_helpful' | 'chat_inaccurate',
-    note?: string
+    note?: string,
+    feedbackTag?: string
   ) => {
     dispatch({
       type: 'ADD_FEEDBACK_EVENT',
@@ -72,26 +100,39 @@ export function AIChat() {
         note,
         metadata: {
           workflow: 'chat',
+          preset: effectiveSettings.aiPreset || 'balanced',
+          provider: inferModelProvider(selectedModel, state.settings),
           model: selectedModel,
+          graphScopeNodeId: activeScope?.nodeId || null,
+          graphScopePath: scopePath || null,
+          feedbackTag,
         },
       },
     });
   };
 
-  const markMessageFeedback = (messageId: string, feedback: 'helpful' | 'inaccurate') => {
+  const markMessageFeedback = (messageId: string, feedback: 'helpful' | 'inaccurate', feedbackTag?: string) => {
     const current = messages.find((message) => message.id === messageId);
-    if (current?.feedback === feedback) return;
+    if (current?.feedback === feedback && current?.feedbackTag === feedbackTag) return;
 
     setMessages((previous) =>
-      previous.map((message) => (message.id === messageId ? { ...message, feedback } : message))
+      previous.map((message) =>
+        message.id === messageId ? { ...message, feedback, feedbackTag: feedback === 'inaccurate' ? feedbackTag : undefined } : message
+      )
     );
-    addFeedback(messageId, feedback === 'helpful' ? 'chat_helpful' : 'chat_inaccurate');
+    addFeedback(messageId, feedback === 'helpful' ? 'chat_helpful' : 'chat_inaccurate', feedback === 'helpful' ? '回答有帮助' : '回答不理想', feedbackTag);
   };
 
   // Sync selectedModel if default changes
   useEffect(() => {
-    setSelectedModel(state.settings.chatModel);
-  }, [state.settings.chatModel]);
+    setSelectedModel(effectiveSettings.chatModel);
+  }, [effectiveSettings.chatModel]);
+
+  useEffect(() => {
+    if (!state.draftChatQuery) return;
+    setInput(state.draftChatQuery);
+    dispatch({ type: 'UPDATE_DRAFT', payload: { draftChatQuery: '' } });
+  }, [dispatch, state.draftChatQuery]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -142,10 +183,23 @@ export function AIChat() {
 
     try {
       let ragMemories: any[] = [];
+      const scopedMemoryPool = activeScope
+        ? getMemoriesForGraphScope(subjectMemories, subjectNodes, activeScope)
+        : subjectMemories;
       if (enableRAG) {
-        setRagStatus('正在检索个人记忆库...');
-        const subjectMemories = state.memories.filter(m => m.subject === state.currentSubject);
-        ragMemories = await searchMemoriesRAG(currentInput, subjectMemories, state.settings, 5, currentImage || undefined);
+        setRagStatus(
+          activeScope?.nodeId
+            ? `当前范围：${scopePath || '节点子树'}，正在混合检索...`
+            : '正在检索个人记忆库...'
+        );
+        ragMemories = await searchMemoriesRAG(
+          currentInput,
+          scopedMemoryPool,
+          { ...effectiveSettings, chatModel: selectedModel },
+          5,
+          currentImage || undefined,
+          scopeNodeIds
+        );
         
         if (ragMemories.length > 0) {
           setRagStatus(`已找到 ${ragMemories.length} 条相关记忆，正在生成回答...`);
@@ -165,11 +219,11 @@ export function AIChat() {
         state.currentSubject, 
         finalContextMemories, 
         state.knowledgeNodes, 
-        { ...state.settings, chatModel: selectedModel }, 
+        { ...effectiveSettings, chatModel: selectedModel }, 
         state.textbooks,
         currentImage || undefined, 
         (log) => {
-          if (state.settings.enableLogging) {
+          if (effectiveSettings.enableLogging) {
             dispatch({
               type: 'ADD_LOG',
               payload: {
@@ -182,19 +236,30 @@ export function AIChat() {
                   ...(log.metadata || {}),
                   selectedMemoryCount: currentSelectedMemories.length,
                   ragEnabled: enableRAG,
+                  graphScopeNodeId: activeScope?.nodeId || null,
+                  graphScopePath: scopePath || null,
+                  graphScopeNodeCount: scopeNodeIds.length,
                 },
               }
             });
           }
         },
-        state.memories // Pass all memories for the tool
+        state.memories,
+        activeScope
+          ? {
+              nodeId: activeScope.nodeId,
+              path: scopePath,
+              nodeIds: scopeNodeIds,
+              relatedNodeIds: relatedScopeNodeIds,
+            }
+          : undefined
       );
       
       const aiMsg: Message = { id: responseMessageId, role: 'ai', content: response };
       setMessages(prev => [...prev, aiMsg]);
 
       // Background memory extraction
-      extractMemoryFromChat(currentInput, response, state.currentSubject, state.settings)
+      extractMemoryFromChat(currentInput, response, state.currentSubject, effectiveSettings)
         .then(memory => {
           if (memory) {
             const memoryResult = createMemoryPayload({
@@ -305,7 +370,7 @@ export function AIChat() {
     setIsReorganizing(true);
     try {
       const subjectMemories = state.memories.filter(m => m.subject === state.currentSubject);
-      const operations = await reorganizeMemories(state.settings, state.currentSubject, subjectMemories);
+      const operations = await reorganizeMemories(effectiveSettings, state.currentSubject, subjectMemories);
       if (operations.length === 0) {
         setMessages(prev => [...prev, { id: Date.now().toString(), role: 'ai', content: '✨ 记忆库已经非常整洁，无需进一步整理。' }]);
       } else {
@@ -326,7 +391,7 @@ export function AIChat() {
     }
   };
 
-  const memories = state.memories.filter(m => m.subject === state.currentSubject);
+  const memories = subjectMemories;
 
   return (
     <div className="flex flex-col h-full w-full p-0 sm:p-2 text-slate-200 overflow-hidden">
@@ -345,6 +410,15 @@ export function AIChat() {
                   {enableRAG ? 'Multimodal RAG Active' : 'RAG Disabled'}
                 </span>
               </div>
+              {activeScope?.nodeId && (
+                <div className="mt-2 flex items-center gap-1.5 max-w-xl">
+                  <Target className="w-3 h-3 text-indigo-400 shrink-0" />
+                  <span className="text-[10px] text-indigo-200 bg-indigo-500/10 border border-indigo-500/20 rounded-full px-2 py-0.5 truncate">
+                    {scopePath || '当前节点作用域'}
+                  </span>
+                  <span className="text-[9px] text-slate-500">{scopeNodeIds.length} 节点</span>
+                </div>
+              )}
             </div>
           </div>
           
@@ -396,7 +470,7 @@ export function AIChat() {
                   {renderMessageContent(msg.content)}
                 </div>
                 {msg.role === 'ai' && (
-                  <div className="mt-4 flex items-center gap-2 text-[10px] uppercase tracking-widest text-slate-500">
+                  <div className="mt-4 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-widest text-slate-500">
                     <span>反馈</span>
                     <button
                       onClick={() => markMessageFeedback(msg.id, 'helpful')}
@@ -422,6 +496,21 @@ export function AIChat() {
                       <ThumbsDown className="h-3 w-3" />
                       不够准
                     </button>
+                    {msg.feedback === 'inaccurate' &&
+                      FEEDBACK_QUICK_TAGS.map((tag) => (
+                        <button
+                          key={`${msg.id}-${tag}`}
+                          onClick={() => markMessageFeedback(msg.id, 'inaccurate', tag)}
+                          className={clsx(
+                            'rounded-full border px-2 py-1 normal-case tracking-normal',
+                            msg.feedbackTag === tag
+                              ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                              : 'border-slate-700 bg-slate-950 text-slate-400 hover:border-slate-600'
+                          )}
+                        >
+                          {tag}
+                        </button>
+                      ))}
                   </div>
                 )}
               </div>
@@ -604,9 +693,9 @@ export function AIChat() {
                                   state.currentSubject,
                                   state.memories,
                                   skill.gatewayType,
-                                  state.settings,
+                                  effectiveSettings,
                                   (log) => {
-                                    if (state.settings.enableLogging) {
+                                    if (effectiveSettings.enableLogging) {
                                       dispatch({
                                         type: 'ADD_LOG',
                                         payload: {

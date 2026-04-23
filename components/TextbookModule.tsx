@@ -1,223 +1,227 @@
 'use client';
 
-import React, { useState, useRef, useEffect } from 'react';
-import { useAppContext } from '@/lib/store';
-import { Textbook, TextbookPage, KnowledgeNode } from '@/lib/types';
-import { 
-  BookOpen, 
-  Upload, 
-  Search, 
-  ChevronLeft, 
-  ChevronRight, 
-  Plus, 
-  Trash2, 
-  FileText, 
-  Image as ImageIcon,
-  Loader2,
-  Network,
-  Copy,
-  Check,
-  Maximize2,
-  Minimize2
-} from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { BookOpen, FileText, Trash2 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { v4 as uuidv4 } from 'uuid';
-import { processTextbookPage, processTextbookPDF, generateTextbookFramework, getEmbedding } from '@/lib/ai';
-import { parsePDF, parseDocx } from '@/lib/file-parsers';
+import { useAppContext } from '@/lib/store';
+import { generateTextbookFramework, getEmbedding, processTextbookPage, processTextbookPDF } from '@/lib/ai';
+import { parseDocx, parsePDF } from '@/lib/file-parsers';
 import { createMemoryPayload } from '@/lib/data/commands';
+import { Textbook, TextbookAnnotation } from '@/lib/types';
+import {
+  findTextbookSection,
+  incrementSectionQuizCount,
+  markTextbookPageVisited,
+  normalizeTextbookForState,
+  upsertTextbookAnnotation,
+} from '@/lib/textbook';
+import { TextbookImportPanel } from '@/components/textbook/TextbookImportPanel';
+import { TextbookOutlinePanel } from '@/components/textbook/TextbookOutlinePanel';
+import { TextbookProcessingResult } from '@/components/textbook/TextbookProcessingResult';
+import { TextbookWorkspace } from '@/components/textbook/TextbookWorkspace';
 
-import { loadPdfJs } from '@/lib/file-parsers';
+type StudyIntent = 'guide' | 'quiz' | 'issues' | 'sync' | null;
 
 export function TextbookModule() {
   const { state, dispatch } = useAppContext();
   const [activeTextbookId, setActiveTextbookId] = useState<string | null>(null);
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [newTextbookName, setNewTextbookName] = useState('');
+  const [enableOCR, setEnableOCR] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
-  const [newTextbookName, setNewTextbookName] = useState('');
-  const [isGeneratingFramework, setIsGeneratingFramework] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [showFramework, setShowFramework] = useState(false);
-  const [selectedText, setSelectedText] = useState('');
-  const [isCreatingMemory, setIsCreatingMemory] = useState(false);
-  const [isFullScreen, setIsFullScreen] = useState(false);
-  const [enableOCR, setEnableOCR] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [pdfDoc, setPdfDoc] = useState<any>(null);
-  const [isRendering, setIsRendering] = useState(false);
-  const [selectionBox, setSelectionBox] = useState<{ startX: number, startY: number, endX: number, endY: number } | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
-
-  const activeTextbook = state.textbooks.find(t => t.id === activeTextbookId);
-  const currentPage = activeTextbook?.pages[currentPageIndex];
-
+  const [activeSectionId, setActiveSectionId] = useState<string | null>(null);
+  const [studyIntent, setStudyIntent] = useState<StudyIntent>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load PDF doc when active textbook changes
+  const subjectTextbooks = useMemo(
+    () => state.textbooks.filter((textbook) => textbook.subject === state.currentSubject),
+    [state.currentSubject, state.textbooks]
+  );
+  const filteredTextbooks = useMemo(
+    () => subjectTextbooks.filter((textbook) => textbook.name.toLowerCase().includes(searchQuery.toLowerCase())),
+    [searchQuery, subjectTextbooks]
+  );
+  const activeTextbook = useMemo(
+    () => state.textbooks.find((textbook) => textbook.id === activeTextbookId) || null,
+    [activeTextbookId, state.textbooks]
+  );
+  const currentPage = activeTextbook?.pages[currentPageIndex];
+
   useEffect(() => {
-    let isMounted = true;
-    if (activeTextbook?.fileId && activeTextbook.fileType === 'application/pdf') {
-      const loadDoc = async () => {
-        try {
-          const { loadFile } = await import('@/lib/store');
-          const buffer = await loadFile(activeTextbook.fileId!);
-          if (buffer && isMounted) {
-            const pdfjsLib = await loadPdfJs();
-            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-            if (pdfjsLib) {
-              const doc = await pdfjsLib.getDocument({ data: buffer }).promise;
-              if (isMounted) setPdfDoc(doc);
-            }
-          }
-        } catch (e) {
-          console.error('Failed to load PDF doc', e);
-        }
-      };
-      loadDoc();
-    } else {
-      setPdfDoc(null);
-    }
-    return () => { isMounted = false; };
-  }, [activeTextbook?.fileId, activeTextbook?.fileType]);
-
-  // Render page when index changes
-  useEffect(() => {
-    let isMounted = true;
-    if (pdfDoc && currentPage) {
-      const renderPage = async () => {
-        setIsRendering(true);
-        try {
-          const page = await pdfDoc.getPage(currentPage.pageNumber);
-          const viewport = page.getViewport({ scale: 2.0 }); // Higher scale for better viewing
-          const canvas = canvasRef.current;
-          if (canvas && isMounted) {
-            const context = canvas.getContext('2d');
-            if (context) {
-              canvas.height = viewport.height;
-              canvas.width = viewport.width;
-              await page.render({ canvasContext: context, viewport }).promise;
-            }
-          }
-        } catch (e) {
-          console.error('Failed to render page', e);
-        } finally {
-          if (isMounted) setIsRendering(false);
-        }
-      };
-      renderPage();
-    }
-    return () => { isMounted = false; };
-  }, [pdfDoc, currentPage?.pageNumber, currentPage]);
-
-  const [selectionMode, setSelectionMode] = useState<'text' | 'image'>('text');
-
-  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (selectionMode !== 'image' || !pdfDoc) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    setSelectionBox({ startX: x, startY: y, endX: x, endY: y });
-    setIsDragging(true);
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (selectionMode !== 'image' || !isDragging || !selectionBox) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    setSelectionBox({ ...selectionBox, endX: x, endY: y });
-  };
-
-  const handleMouseUp = () => {
-    if (selectionMode === 'image') {
-      setIsDragging(false);
-    }
-  };
-
-  const handleCreateImageMemory = async () => {
-    if (!selectionBox || !canvasRef.current || !activeTextbook) return;
-    
-    const canvas = canvasRef.current;
-    const rect = canvas.getBoundingClientRect();
-    
-    // Calculate scale between displayed size and actual canvas size
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-
-    const x = Math.min(selectionBox.startX, selectionBox.endX) * scaleX;
-    const y = Math.min(selectionBox.startY, selectionBox.endY) * scaleY;
-    const width = Math.abs(selectionBox.endX - selectionBox.startX) * scaleX;
-    const height = Math.abs(selectionBox.endY - selectionBox.startY) * scaleY;
-
-    if (width < 10 || height < 10) {
-      setSelectionBox(null);
+    if (!activeTextbookId && filteredTextbooks.length > 0) {
+      setActiveTextbookId(filteredTextbooks[0].id);
       return;
     }
 
-    const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = width;
-    cropCanvas.height = height;
-    const ctx = cropCanvas.getContext('2d');
-    if (!ctx) return;
+    if (activeTextbookId && !filteredTextbooks.some((textbook) => textbook.id === activeTextbookId)) {
+      setActiveTextbookId(filteredTextbooks[0]?.id || null);
+      setCurrentPageIndex(0);
+    }
+  }, [activeTextbookId, filteredTextbooks]);
 
-    ctx.drawImage(canvas, x, y, width, height, 0, 0, width, height);
-    const base64Image = cropCanvas.toDataURL('image/jpeg', 0.9);
+  useEffect(() => {
+    if (!activeTextbook) {
+      setActiveSectionId(null);
+      return;
+    }
 
-    setIsCreatingMemory(true);
-    try {
-      // Get OCR and embedding for the cropped image
-      const { content, embedding } = await processTextbookPage(
-        base64Image,
-        currentPage?.pageNumber || 1,
-        state.settings
-      );
+    const page = activeTextbook.pages[currentPageIndex];
+    const deepestSectionId = page?.sectionIds?.[page.sectionIds.length - 1] || activeTextbook.toc?.[0]?.id || null;
+    setActiveSectionId(deepestSectionId);
+  }, [activeTextbook, currentPageIndex]);
 
+  useEffect(() => {
+    if (!activeTextbook || activeTextbook.entryMode !== 'workspace' || !currentPage) return;
+    const alreadyVisited = activeTextbook.studyStats?.readPageNumbers?.includes(currentPage.pageNumber);
+    const lastOpenedPage = activeTextbook.studyStats?.lastOpenedPage;
+    if (alreadyVisited && lastOpenedPage === currentPage.pageNumber) return;
+    dispatch({
+      type: 'UPDATE_TEXTBOOK',
+      payload: markTextbookPageVisited(activeTextbook, currentPage.pageNumber, activeSectionId),
+    });
+  }, [activeSectionId, activeTextbook, currentPage, dispatch]);
+
+  useEffect(() => {
+    if (!activeTextbook) return;
+    if (currentPageIndex >= activeTextbook.pages.length) {
+      setCurrentPageIndex(Math.max(0, activeTextbook.pages.length - 1));
+    }
+  }, [activeTextbook, currentPageIndex]);
+
+  const subjectMemories = useMemo(
+    () => state.memories.filter((memory) => memory.subject === state.currentSubject),
+    [state.currentSubject, state.memories]
+  );
+  const subjectNodes = useMemo(
+    () => state.knowledgeNodes.filter((node) => node.subject === state.currentSubject),
+    [state.currentSubject, state.knowledgeNodes]
+  );
+
+  const logCallback = (log: any) => {
+    if (!state.settings.enableLogging) return;
+    dispatch({
+      type: 'ADD_LOG',
+      payload: {
+        ...log,
+        subject: state.currentSubject,
+        workflow: 'chat',
+      },
+    });
+  };
+
+  const updateActiveTextbook = (nextTextbook: Textbook) => {
+    dispatch({ type: 'UPDATE_TEXTBOOK', payload: normalizeTextbookForState(nextTextbook) });
+  };
+
+  const openWorkspace = (intent: StudyIntent = null) => {
+    if (!activeTextbook) return;
+    if (activeTextbook.entryMode !== 'workspace') {
+      updateActiveTextbook({ ...activeTextbook, entryMode: 'workspace' });
+    }
+    setStudyIntent(intent);
+  };
+
+  const jumpToPage = (pageNumber: number) => {
+    const nextIndex = Math.max(0, Math.min((activeTextbook?.pages.length || 1) - 1, pageNumber - 1));
+    setCurrentPageIndex(nextIndex);
+    if (activeTextbook?.entryMode !== 'workspace') {
+      openWorkspace('issues');
+    }
+  };
+
+  const handleSectionSelect = (sectionId: string, pageNumber: number) => {
+    setActiveSectionId(sectionId);
+    jumpToPage(pageNumber);
+    openWorkspace(null);
+  };
+
+  const handleQuizGenerated = (sectionId?: string | null) => {
+    if (!activeTextbook) return;
+    dispatch({
+      type: 'UPDATE_TEXTBOOK',
+      payload: incrementSectionQuizCount(activeTextbook, sectionId),
+    });
+  };
+
+  const handleSyncRequest = () => {
+    setNotice('课本内图谱同步入口已预留。当前版本不会自动写入全局知识图谱，请先在工作台内确认结构与重点。');
+  };
+
+  const handleCreateAnnotation = async (input: {
+    type: TextbookAnnotation['type'];
+    text: string;
+    note?: string;
+    startOffset?: number;
+    endOffset?: number;
+  }) => {
+    if (!activeTextbook || !currentPage) return;
+
+    const annotation: TextbookAnnotation = {
+      id: uuidv4(),
+      pageNumber: currentPage.pageNumber,
+      type: input.type,
+      text: input.text,
+      note: input.note,
+      startOffset: input.startOffset,
+      endOffset: input.endOffset,
+      createdAt: Date.now(),
+      sectionId: activeSectionId || currentPage.sectionIds?.[currentPage.sectionIds.length - 1],
+    };
+
+    const nextTextbook = upsertTextbookAnnotation(activeTextbook, currentPage.pageNumber, annotation);
+    dispatch({ type: 'UPDATE_TEXTBOOK', payload: nextTextbook });
+
+    if (input.type === 'memory') {
+      const embedding = await getEmbedding(input.text, state.settings);
       const memoryResult = createMemoryPayload({
         id: uuidv4(),
         subject: activeTextbook.subject,
-        content: content || '图片摘抄',
+        content: input.text,
+        notes: input.note,
         functionType: '细碎记忆',
         purposeType: '记忆型',
         knowledgeNodeIds: [],
         confidence: 50,
         mastery: 0,
         createdAt: Date.now(),
-        sourceType: 'image' as const,
-        imageUrl: base64Image,
-        source: `摘自《${activeTextbook.name}》第 ${currentPage?.pageNumber} 页`,
+        sourceType: 'text' as const,
+        source: `摘自《${activeTextbook.name}》第 ${currentPage.pageNumber} 页`,
         sourceTextbookId: activeTextbook.id,
-        sourceTextbookPage: currentPage?.pageNumber,
+        sourceTextbookPage: currentPage.pageNumber,
         embedding,
-        dataSource: 'textbook_extract'
+        dataSource: 'textbook_extract',
+        evidence: {
+          sourceText: input.text,
+          locationHint: `第 ${currentPage.pageNumber} 页`,
+          keySentence: input.note || input.text,
+        },
       });
 
-      if (!memoryResult.ok) {
-        throw new Error(memoryResult.error);
+      if (memoryResult.ok) {
+        dispatch({ type: 'ADD_MEMORY', payload: memoryResult.value });
+        setNotice('已将标注内容同步生成到记忆库。');
+      } else {
+        setNotice(`记忆生成失败：${memoryResult.error}`);
       }
-
-      dispatch({ type: 'ADD_MEMORY', payload: memoryResult.value });
-      setSelectionBox(null);
-      alert('已成功摘抄图片至记忆库！');
-    } catch (error) {
-      console.error('Failed to create image memory', error);
-      alert('摘抄失败');
-    } finally {
-      setIsCreatingMemory(false);
     }
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
     if (!files || files.length === 0) return;
-    
+
     setIsUploading(true);
     setError(null);
+    setNotice(null);
     const fileList = Array.from(files);
     setUploadProgress({ current: 0, total: fileList.length });
 
-    const allPages: TextbookPage[] = [];
+    const allPages: Textbook['pages'] = [];
     let primaryFileId: string | undefined;
     let primaryFileType: string | undefined;
     let finalName = newTextbookName.trim();
@@ -225,7 +229,7 @@ export function TextbookModule() {
     try {
       for (const file of fileList) {
         if (!finalName) {
-          finalName = file.name.replace(/\.[^/.]+$/, "");
+          finalName = file.name.replace(/\.[^/.]+$/, '');
         }
 
         if (file.type === 'application/pdf') {
@@ -234,101 +238,88 @@ export function TextbookModule() {
             primaryFileId = fileId;
             primaryFileType = file.type;
           }
-          
+
           const { saveFile } = await import('@/lib/store');
           const arrayBuffer = await file.arrayBuffer();
           await saveFile(fileId, arrayBuffer);
 
           if (enableOCR) {
-            dispatch({ 
-              type: 'ADD_LOG', 
-              payload: { 
-                type: 'parse', 
-                model: state.settings.parseModel,
-                prompt: `[Textbook PDF OCR Start]`,
-                response: `正在对整个 PDF 进行 OCR 识别，请稍候...` 
-              } 
-            });
-
             const reader = new FileReader();
             const base64 = await new Promise<string>((resolve) => {
               reader.onloadend = () => resolve(reader.result as string);
               reader.readAsDataURL(file);
             });
+            const ocrResults = await processTextbookPDF(base64, state.settings, logCallback);
+            const fallbackPages = ocrResults.length === 0 ? await parsePDF(file) : [];
+            const pagePayloads =
+              ocrResults.length > 0
+                ? ocrResults.map((item) => ({ pageNumber: item.pageNumber, textContent: item.content }))
+                : fallbackPages;
 
-            const ocrResults = await processTextbookPDF(
-              base64,
-              state.settings,
-              (log) => dispatch({ type: 'ADD_LOG', payload: log })
-            );
+            setUploadProgress((current) => ({
+              current: current.current,
+              total: Math.max(current.total, fileList.length + pagePayloads.length - 1),
+            }));
 
-            setUploadProgress(prev => ({ ...prev, total: prev.total + ocrResults.length - 1 }));
-
-            for (const res of ocrResults) {
-              const embedding = await getEmbedding(res.content);
+            for (const page of pagePayloads) {
+              const embedding = await getEmbedding(page.textContent, state.settings);
               allPages.push({
                 id: uuidv4(),
-                pageNumber: res.pageNumber,
-                content: res.content,
+                pageNumber: page.pageNumber,
+                content: page.textContent,
                 imageUrl: '',
-                embedding
+                embedding,
               });
-              setUploadProgress(prev => ({ ...prev, current: prev.current + 1 }));
+              setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
             }
           } else {
             const pdfPages = await parsePDF(file);
-            setUploadProgress(prev => ({ ...prev, total: prev.total + pdfPages.length - 1 }));
-            
-            for (const p of pdfPages) {
-              const embedding = await getEmbedding(p.textContent);
+            setUploadProgress((current) => ({
+              current: current.current,
+              total: Math.max(current.total, fileList.length + pdfPages.length - 1),
+            }));
+            for (const page of pdfPages) {
+              const embedding = await getEmbedding(page.textContent, state.settings);
               allPages.push({
                 id: uuidv4(),
-                pageNumber: p.pageNumber,
-                content: p.textContent,
+                pageNumber: page.pageNumber,
+                content: page.textContent,
                 imageUrl: '',
-                embedding
+                embedding,
               });
-              setUploadProgress(prev => ({ ...prev, current: prev.current + 1 }));
+              setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
             }
           }
         } else if (file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
           const { content } = await parseDocx(file);
-          // For docx, we just create one "page" for now as it's text-based
-          const embedding = await getEmbedding(content);
+          const embedding = await getEmbedding(content, state.settings);
           allPages.push({
             id: uuidv4(),
             pageNumber: 1,
             content,
-            imageUrl: '', // No image for docx yet
-            embedding
+            imageUrl: '',
+            embedding,
           });
-          setUploadProgress(prev => ({ ...prev, current: prev.current + 1 }));
+          setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
         } else if (file.type.startsWith('image/')) {
           const reader = new FileReader();
           const base64 = await new Promise<string>((resolve) => {
             reader.onloadend = () => resolve(reader.result as string);
             reader.readAsDataURL(file);
           });
-
-          const { content, embedding } = await processTextbookPage(
-            base64, 
-            allPages.length + 1, 
-            state.settings,
-            (log) => dispatch({ type: 'ADD_LOG', payload: log })
-          );
-          
+          const { content, embedding } = await processTextbookPage(base64, allPages.length + 1, state.settings, logCallback);
           allPages.push({
             id: uuidv4(),
             pageNumber: allPages.length + 1,
             content,
             imageUrl: base64,
-            embedding
+            embedding,
           });
-          setUploadProgress(prev => ({ ...prev, current: prev.current + 1 }));
+          setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
         }
       }
 
-      const newTextbook: Textbook = {
+      const textbookBase: Textbook = {
         id: uuidv4(),
         name: finalName || '未命名课本',
         subject: state.currentSubject,
@@ -336,432 +327,184 @@ export function TextbookModule() {
         fileType: primaryFileType,
         totalPages: allPages.length,
         pages: allPages,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        entryMode: 'result',
       };
+
+      const framework = await generateTextbookFramework(textbookBase, state.settings, logCallback).catch(() => []);
+      const newTextbook = normalizeTextbookForState({
+        ...textbookBase,
+        framework,
+        processingStatus: undefined,
+        entryMode: 'result',
+      });
 
       dispatch({ type: 'ADD_TEXTBOOK', payload: newTextbook });
       setActiveTextbookId(newTextbook.id);
+      setCurrentPageIndex(Math.max(0, (newTextbook.studyStats?.lastOpenedPage || 1) - 1));
+      setActiveSectionId(newTextbook.toc?.[0]?.id || null);
+      setStudyIntent(newTextbook.processingStatus === 'needs_review' ? 'issues' : null);
       setNewTextbookName('');
       if (fileInputRef.current) fileInputRef.current.value = '';
-    } catch (err: any) {
-      console.error('Upload failed', err);
-      setError(err.message || '导入失败，请检查文件格式或网络连接');
-      dispatch({ 
-        type: 'ADD_LOG', 
-        payload: { 
-          id: uuidv4(),
-          timestamp: Date.now(),
-          type: 'parse', 
+      setNotice('导入完成，已进入处理结果页。可以先检查结构和低置信页，再进入学习工作台。');
+    } catch (uploadError: any) {
+      console.error('Upload failed', uploadError);
+      setError(uploadError.message || '导入失败，请检查文件格式或网络连接');
+      dispatch({
+        type: 'ADD_LOG',
+        payload: {
+          type: 'parse',
           model: state.settings.parseModel,
           prompt: '[Textbook Import Error]',
-          response: `课本导入失败: ${err.message || '未知错误'}` 
-        } 
+          response: `课本导入失败: ${uploadError.message || '未知错误'}`,
+          subject: state.currentSubject,
+        },
       });
     } finally {
       setIsUploading(false);
     }
   };
 
-  const handleGenerateFramework = async () => {
-    if (!activeTextbook) return;
-    setIsGeneratingFramework(true);
-    try {
-      const framework = await generateTextbookFramework(
-        activeTextbook, 
-        state.settings,
-        (log) => dispatch({ type: 'ADD_LOG', payload: log })
-      );
-      dispatch({ 
-        type: 'UPDATE_TEXTBOOK', 
-        payload: { ...activeTextbook, framework } 
-      });
-    } catch (error) {
-      console.error('Failed to generate framework', error);
-    } finally {
-      setIsGeneratingFramework(false);
-    }
-  };
-
-  const handleCreateMemoryFromSelection = async () => {
-    if (!selectedText || !activeTextbook) return;
-    setIsCreatingMemory(true);
-    try {
-      const embedding = await getEmbedding(selectedText);
-      const memoryResult = createMemoryPayload({
-        id: uuidv4(),
-        subject: activeTextbook.subject,
-        content: selectedText,
-        functionType: '细碎记忆',
-        purposeType: '记忆型',
-        knowledgeNodeIds: [],
-        confidence: 50,
-        mastery: 0,
-        createdAt: Date.now(),
-        sourceType: 'text' as const,
-        source: `摘自《${activeTextbook.name}》第 ${currentPage?.pageNumber} 页`,
-        sourceTextbookId: activeTextbook.id,
-        sourceTextbookPage: currentPage?.pageNumber,
-        embedding,
-        dataSource: 'textbook_extract'
-      });
-
-      if (!memoryResult.ok) {
-        throw new Error(memoryResult.error);
-      }
-
-      dispatch({ type: 'ADD_MEMORY', payload: memoryResult.value });
-      setSelectedText('');
-      alert('已成功摘抄至记忆库！');
-    } catch (error) {
-      console.error('Failed to create memory', error);
-    } finally {
-      setIsCreatingMemory(false);
-    }
-  };
-
-  const filteredTextbooks = state.textbooks.filter(t => 
-    t.subject === state.currentSubject && 
-    (t.name.toLowerCase().includes(searchQuery.toLowerCase()))
-  );
-
   return (
     <div className="flex h-full bg-black text-slate-200 overflow-hidden">
-      {/* Left Sidebar: Textbook List */}
-      <div className="w-56 border-r border-slate-900 flex flex-col shrink-0">
-        <div className="p-3 border-b border-slate-900">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xs font-bold flex items-center gap-2">
-              <BookOpen className="w-3.5 h-3.5 text-blue-400" />
-              课本库
-            </h2>
-          </div>
-          <div className="relative mb-4">
-            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
-            <input 
-              type="text" 
-              placeholder="搜索课本..." 
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-slate-900/50 border border-slate-900 rounded-md py-1.5 pl-8 pr-3 text-xs focus:outline-none focus:border-blue-500 transition-all"
-            />
-          </div>
-          <div className="space-y-2">
-            <input 
-              type="text" 
-              placeholder="新课本名称 (可选)..." 
-              value={newTextbookName}
-              onChange={(e) => setNewTextbookName(e.target.value)}
-              className="w-full bg-slate-900/50 border border-slate-900 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:border-blue-500 transition-all"
-            />
-            <div className="flex items-center gap-2 px-1">
-              <input 
-                type="checkbox" 
-                id="enable-ocr"
-                checked={enableOCR}
-                onChange={(e) => setEnableOCR(e.target.checked)}
-                className="w-3 h-3 rounded border-slate-900 bg-slate-900/50 text-indigo-500 focus:ring-indigo-500"
-              />
-              <label htmlFor="enable-ocr" className="text-[10px] text-slate-400 cursor-pointer select-none">
-                启用 AI OCR (更精准但较慢)
-              </label>
-            </div>
-            <button 
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isUploading}
-              className="w-full flex items-center justify-center gap-2 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:hover:bg-indigo-600 text-white rounded-md text-xs font-medium transition-all"
-            >
-              {isUploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-              {isUploading ? `上传中 ${uploadProgress.current}/${uploadProgress.total}` : '导入课本 (PDF/DOC/图)'}
-            </button>
-            {error && (
-              <div className="p-2 text-[10px] text-red-400 bg-red-900/20 border border-red-900/50 rounded-md">
-                {error}
-              </div>
-            )}
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              onChange={handleFileUpload} 
-              className="hidden" 
-              multiple 
-              accept=".pdf,.docx,image/*"
-            />
-          </div>
-        </div>
+      <aside className="w-[320px] border-r border-slate-900 flex flex-col shrink-0">
+        <TextbookImportPanel
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          newTextbookName={newTextbookName}
+          onNewTextbookNameChange={setNewTextbookName}
+          enableOCR={enableOCR}
+          onEnableOCRChange={setEnableOCR}
+          isUploading={isUploading}
+          uploadProgress={uploadProgress}
+          error={error}
+          onUploadClick={() => fileInputRef.current?.click()}
+        />
 
-        <div className="flex-1 overflow-y-auto p-2 space-y-1 custom-scrollbar">
-          {filteredTextbooks.map(t => (
-            <div 
-              key={t.id}
-              className={clsx(
-                "group flex items-center justify-between p-2 rounded-md cursor-pointer transition-all",
-                activeTextbookId === t.id ? "bg-slate-900 text-blue-400" : "hover:bg-slate-900/50 text-slate-400 hover:text-slate-200"
-              )}
+        <div className="p-2 border-b border-slate-900 max-h-[240px] overflow-y-auto custom-scrollbar space-y-1 shrink-0">
+          {filteredTextbooks.map((textbook) => (
+            <button
+              key={textbook.id}
               onClick={() => {
-                setActiveTextbookId(t.id);
-                setCurrentPageIndex(0);
+                setActiveTextbookId(textbook.id);
+                const nextPage = Math.max(0, (textbook.studyStats?.lastOpenedPage || 1) - 1);
+                setCurrentPageIndex(nextPage);
+                setActiveSectionId(textbook.studyStats?.lastOpenedSectionId || textbook.toc?.[0]?.id || null);
               }}
+              className={clsx(
+                'w-full rounded-2xl border px-3 py-3 text-left transition-colors',
+                activeTextbookId === textbook.id
+                  ? 'border-indigo-500/60 bg-indigo-500/10'
+                  : 'border-slate-900 bg-slate-950/60 hover:border-slate-800'
+              )}
             >
-              <div className="flex items-center gap-2 min-w-0">
-                <FileText className="w-3.5 h-3.5 shrink-0" />
-                <span className="text-xs truncate">{t.name}</span>
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <FileText className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                    <span className="text-xs font-medium text-slate-100 truncate">{textbook.name}</span>
+                  </div>
+                  <div className="mt-1 text-[10px] text-slate-500">
+                    {textbook.entryMode === 'result' ? '处理结果页' : '学习工作台'} · {textbook.processingStatus === 'needs_review' ? '待复核' : '已就绪'}
+                  </div>
+                </div>
+                <span
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (confirm('确定删除这本课本吗？')) {
+                      dispatch({ type: 'DELETE_TEXTBOOK', payload: textbook.id });
+                      if (activeTextbookId === textbook.id) {
+                        setActiveTextbookId(null);
+                        setCurrentPageIndex(0);
+                        setActiveSectionId(null);
+                      }
+                    }
+                  }}
+                  className="rounded-lg p-1 text-slate-500 hover:text-red-400"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </span>
               </div>
-              <button 
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (confirm('确定删除这本课本吗？')) {
-                    dispatch({ type: 'DELETE_TEXTBOOK', payload: t.id });
-                    if (activeTextbookId === t.id) setActiveTextbookId(null);
-                  }
-                }}
-                className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-400 transition-all"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            </div>
+            </button>
           ))}
+
           {filteredTextbooks.length === 0 && (
-            <div className="text-center py-8 text-slate-600 text-[10px]">
-              暂无课本，请先导入
+            <div className="h-full flex flex-col items-center justify-center text-center text-slate-600 px-4">
+              <BookOpen className="w-10 h-10 mb-3 opacity-20" />
+              <p className="text-xs">当前学科还没有课本，先导入一本开始建立教材知识底座。</p>
             </div>
           )}
         </div>
-      </div>
 
-      {/* Main Content: Textbook Viewer */}
-      <div className="flex-1 flex flex-col min-w-0 relative">
-        {activeTextbook ? (
-          <>
-            {/* Toolbar */}
-            <div className="h-10 border-b border-slate-900 flex items-center justify-between px-3 shrink-0">
-              <div className="flex items-center gap-3">
-                <h3 className="text-xs font-bold truncate max-w-[150px]">{activeTextbook.name}</h3>
-                <div className="h-3 w-[1px] bg-slate-900" />
-                <div className="flex items-center gap-1.5">
-                  <button 
-                    onClick={() => setCurrentPageIndex(prev => Math.max(0, prev - 1))}
-                    disabled={currentPageIndex === 0}
-                    className="p-1 hover:bg-slate-900 rounded transition-all"
-                  >
-                    <ChevronLeft className="w-3.5 h-3.5" />
-                  </button>
-                  <span className="text-[10px] font-mono w-14 text-center">
-                    {currentPageIndex + 1} / {activeTextbook.pages.length}
-                  </span>
-                  <button 
-                    onClick={() => setCurrentPageIndex(prev => Math.min(activeTextbook.pages.length - 1, prev + 1))}
-                    disabled={currentPageIndex === activeTextbook.pages.length - 1}
-                    className="p-1 hover:bg-slate-900 rounded transition-all"
-                  >
-                    <ChevronRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
+        {activeTextbook && (
+          <div className="flex-1 min-h-0">
+            <TextbookOutlinePanel
+              textbook={activeTextbook}
+              activeSectionId={activeSectionId}
+              onSelectSection={handleSectionSelect}
+              onJumpToPage={jumpToPage}
+            />
+          </div>
+        )}
 
-              <div className="flex items-center gap-2">
-                {activeTextbook.fileType === 'application/pdf' && (
-                  <div className="flex items-center bg-slate-900 rounded-md p-0.5 mr-2">
-                    <button
-                      onClick={() => {
-                        setSelectionMode('text');
-                        setSelectionBox(null);
-                      }}
-                      className={clsx(
-                        "px-3 py-1 text-xs font-medium rounded-sm transition-all",
-                        selectionMode === 'text' ? "bg-slate-800 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
-                      )}
-                    >
-                      选文字
-                    </button>
-                    <button
-                      onClick={() => {
-                        setSelectionMode('image');
-                        window.getSelection()?.removeAllRanges();
-                      }}
-                      className={clsx(
-                        "px-3 py-1 text-xs font-medium rounded-sm transition-all",
-                        selectionMode === 'image' ? "bg-slate-800 text-white shadow-sm" : "text-slate-400 hover:text-slate-200"
-                      )}
-                    >
-                      框图片
-                    </button>
-                  </div>
-                )}
-                <button 
-                  onClick={() => setShowFramework(!showFramework)}
-                  className={clsx(
-                    "flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-all",
-                    showFramework ? "bg-purple-600 text-white" : "bg-slate-900 text-slate-400 hover:text-slate-200"
-                  )}
-                >
-                  <Network className="w-3.5 h-3.5" />
-                  知识框架
-                </button>
-                <button 
-                  onClick={() => setIsFullScreen(!isFullScreen)}
-                  className="p-1.5 bg-slate-900 text-slate-400 hover:text-slate-200 rounded-md transition-all"
-                >
-                  {isFullScreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleFileUpload}
+          className="hidden"
+          multiple
+          accept=".pdf,.docx,image/*"
+        />
+      </aside>
 
-            {/* Viewer Area */}
-            <div className="flex-1 flex overflow-hidden">
-              {/* Page Content */}
-              <div className="flex-1 overflow-y-auto p-4 flex flex-col items-center bg-black custom-scrollbar">
-                <div 
-                  className={clsx(
-                    "bg-slate-800 shadow-2xl transition-all duration-300 relative group",
-                    isFullScreen ? "w-full max-w-5xl" : "w-full max-w-2xl"
-                  )}
-                  onMouseDown={handleMouseDown}
-                  onMouseMove={handleMouseMove}
-                  onMouseUp={handleMouseUp}
-                  onMouseLeave={handleMouseUp}
-                >
-                  {activeTextbook.fileType === 'application/pdf' ? (
-                    <div className="relative w-full">
-                      <canvas 
-                        ref={canvasRef} 
-                        className="w-full h-auto select-none"
-                      />
-                      {isRendering && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm">
-                          <Loader2 className="w-8 h-8 animate-spin text-indigo-400" />
-                        </div>
-                      )}
-                      {selectionBox && (
-                        <div 
-                          className="absolute border-2 border-indigo-500 bg-indigo-500/20 pointer-events-none"
-                          style={{
-                            left: Math.min(selectionBox.startX, selectionBox.endX),
-                            top: Math.min(selectionBox.startY, selectionBox.endY),
-                            width: Math.abs(selectionBox.endX - selectionBox.startX),
-                            height: Math.abs(selectionBox.endY - selectionBox.startY)
-                          }}
-                        />
-                      )}
-                      {selectionBox && !isDragging && (
-                        <button
-                          onClick={handleCreateImageMemory}
-                          className="absolute z-10 bg-indigo-600 text-white px-3 py-1.5 rounded-md text-xs font-medium shadow-lg hover:bg-indigo-700 transition-all"
-                          style={{
-                            left: Math.min(selectionBox.startX, selectionBox.endX),
-                            top: Math.max(selectionBox.startY, selectionBox.endY) + 8
-                          }}
-                        >
-                          {isCreatingMemory ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : '摘抄图片'}
-                        </button>
-                      )}
-                    </div>
-                  ) : currentPage?.imageUrl ? (
-                    /* eslint-disable-next-line @next/next/no-img-element */
-                    <img 
-                      src={currentPage.imageUrl} 
-                      alt={`Page ${currentPage.pageNumber}`}
-                      className="w-full h-auto select-none"
-                    />
-                  ) : (
-                    <div className="aspect-[3/4] flex items-center justify-center text-slate-500 bg-slate-900">
-                      <div className="text-center">
-                        <FileText className="w-12 h-12 mx-auto mb-4 opacity-20" />
-                        <p className="text-sm opacity-40">纯文本内容</p>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {/* Text Overlay / Selection Layer */}
-                  <div 
-                    className={clsx(
-                      "absolute inset-0 p-8 text-transparent select-text whitespace-pre-wrap font-serif leading-relaxed overflow-hidden",
-                      selectionMode === 'image' ? "pointer-events-none" : ""
-                    )}
-                    onMouseUp={() => {
-                      if (selectionMode === 'text') {
-                        const selection = window.getSelection();
-                        if (selection && selection.toString().trim()) {
-                          setSelectedText(selection.toString().trim());
-                        }
-                      }
-                    }}
-                  >
-                    {currentPage?.content}
-                  </div>
-                </div>
-              </div>
+      <div className="flex-1 min-w-0 flex flex-col">
+        {notice && (
+          <div className="border-b border-slate-900 bg-indigo-950/20 px-4 py-2 text-xs text-indigo-100 flex items-center justify-between">
+            <span>{notice}</span>
+            <button onClick={() => setNotice(null)} className="text-indigo-200/80 hover:text-white">
+              关闭
+            </button>
+          </div>
+        )}
 
-              {/* Right Panel: Framework / Selection Info */}
-              {showFramework && (
-                <div className="w-80 border-l border-slate-900 bg-black flex flex-col shrink-0 animate-in slide-in-from-right duration-300">
-                  <div className="p-4 border-b border-slate-900 flex items-center justify-between">
-                    <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">知识框架</h4>
-                    {!activeTextbook.framework && (
-                      <button 
-                        onClick={handleGenerateFramework}
-                        disabled={isGeneratingFramework}
-                        className="text-[10px] text-blue-400 hover:text-blue-300 font-bold flex items-center gap-1 disabled:opacity-50"
-                      >
-                        {isGeneratingFramework ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Plus className="w-2.5 h-2.5" />}
-                        AI 构建
-                      </button>
-                    )}
-                  </div>
-                  <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-                    {activeTextbook.framework ? (
-                      <div className="space-y-2">
-                        {activeTextbook.framework.map(node => (
-                          <div 
-                            key={node.id}
-                            style={{ paddingLeft: `${(node.id.split('.').length - 1) * 12}px` }}
-                            className="flex items-center gap-2 py-1 group"
-                          >
-                            <div className="w-1 h-1 rounded-full bg-indigo-500/50" />
-                            <span className="text-xs text-slate-400 group-hover:text-slate-200 transition-colors cursor-default">
-                              {node.name}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-center opacity-30">
-                        <Network className="w-8 h-8 mb-2" />
-                        <p className="text-[10px]">尚未构建框架<br/>点击上方按钮由 AI 分析</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Selection Floating Action */}
-            {selectedText && (
-              <div className="absolute bottom-8 left-1/2 -translate-x-1/2 bg-slate-900 border border-slate-800 rounded-full shadow-2xl p-1 flex items-center gap-1 animate-in fade-in zoom-in duration-200 z-50">
-                <div className="px-4 py-1.5 max-w-[200px] truncate text-[10px] text-slate-400 border-r border-slate-800">
-                  &quot;{selectedText}&quot;
-                </div>
-                <button 
-                  onClick={handleCreateMemoryFromSelection}
-                  disabled={isCreatingMemory}
-                  className="flex items-center gap-2 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full text-[10px] font-bold transition-all disabled:opacity-50"
-                >
-                  {isCreatingMemory ? <Loader2 className="w-3 h-3 animate-spin" /> : <Copy className="w-3 h-3" />}
-                  摘抄至记忆库
-                </button>
-                <button 
-                  onClick={() => setSelectedText('')}
-                  className="p-1.5 hover:bg-slate-800 text-slate-500 rounded-full transition-all"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
-          </>
-        ) : (
+        {!activeTextbook ? (
           <div className="flex-1 flex flex-col items-center justify-center text-slate-600">
             <BookOpen className="w-16 h-16 mb-4 opacity-10" />
-            <p className="text-sm font-medium opacity-40">请从左侧选择一本课本开始学习</p>
+            <p className="text-sm font-medium opacity-40">请从左侧导入或选择一本课本开始学习</p>
           </div>
+        ) : activeTextbook.entryMode === 'result' ? (
+          <TextbookProcessingResult
+            textbook={activeTextbook}
+            onOpenWorkspace={() => openWorkspace(null)}
+            onOpenGuide={() => openWorkspace('guide')}
+            onOpenQuiz={() => openWorkspace('quiz')}
+            onInspectIssues={() => {
+              openWorkspace('issues');
+              setNotice('低置信页和结构复核入口已打开。你也可以直接在左侧目录中跳转到问题页。');
+            }}
+            onSyncGraph={() => {
+              setStudyIntent('sync');
+              handleSyncRequest();
+            }}
+          />
+        ) : (
+          <TextbookWorkspace
+            textbook={activeTextbook}
+            currentPageIndex={currentPageIndex}
+            onPageChange={setCurrentPageIndex}
+            onCreateAnnotation={handleCreateAnnotation}
+            memories={subjectMemories}
+            knowledgeNodes={subjectNodes}
+            settings={state.settings}
+            intent={studyIntent}
+            onIntentHandled={() => setStudyIntent(null)}
+            onJumpToPage={jumpToPage}
+            onQuizGenerated={handleQuizGenerated}
+            onSyncRequest={handleSyncRequest}
+            activeSectionId={activeSectionId}
+            logCallback={logCallback}
+          />
         )}
       </div>
     </div>

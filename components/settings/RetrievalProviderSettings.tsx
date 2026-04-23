@@ -82,9 +82,15 @@ function ProviderCard(props: {
 
 export default function RetrievalProviderSettings() {
   const { state, dispatch } = useAppContext();
+  const isAdvanced = (state.settings.aiPreset || 'balanced') === 'advanced';
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300">
+      <section className="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 text-xs text-amber-100">
+        {isAdvanced
+          ? '当前处于高级自定义模式：这里的配置会参与检索链路。'
+          : '当前不是高级自定义模式：首版默认走 hybrid-only，下面配置仅作后备扩展。'}
+      </section>
       <ProviderCard
         title="Reranker Provider"
         description="期望接口：POST JSON，入参 { model, query, documents }，返回 { results: [{ id, score, reason? }] }。"

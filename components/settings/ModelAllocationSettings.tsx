@@ -1,185 +1,230 @@
 'use client';
 
-import React from 'react';
-import { useAppContext } from '@/lib/store';
-import { Cpu, Brain, MessageSquare, Network, BookOpen, Languages, Pencil, Search, Zap } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Brain, ChevronDown, ChevronUp, Cpu, Network, Search, Sparkles } from 'lucide-react';
 
-// Task categories with icons and descriptions
-const TASK_CONFIGS = [
+import { useAppContext } from '@/lib/store';
+import { getPresetExampleModels } from '@/lib/ai';
+import type { AIPreset, Settings } from '@/lib/types';
+
+const PRESET_CARDS: Array<{
+  id: Exclude<AIPreset, 'advanced'> | 'advanced';
+  title: string;
+  description: string;
+  highlights: string[];
+}> = [
   {
-    key: 'parseModel',
-    label: '笔记解析',
-    icon: BookOpen,
-    description: '用于识别和结构化处理上传的作业、试卷、笔记图片',
-    badge: '核心',
-    badgeColor: 'indigo',
+    id: 'quality',
+    title: '质量优先',
+    description: '更强生成模型，适合重讲原理、错因分析、整卷梳理。',
+    highlights: ['答题更稳', '讲解更深', '延迟略高'],
   },
   {
-    key: 'chatModel',
-    label: 'AI 答疑对话',
-    icon: MessageSquare,
-    description: '用于与学生进行深度问答、解题过程讲解',
-    badge: '核心',
-    badgeColor: 'indigo',
+    id: 'balanced',
+    title: '均衡',
+    description: '默认推荐。保留较好效果，同时减少时延与配置负担。',
+    highlights: ['默认可用', '速度更快', '日常录入更顺'],
   },
   {
-    key: 'graphModel',
-    label: '知识图谱生成',
-    icon: Network,
-    description: '用于分析知识点关联、自动构建和更新知识树',
-    badge: '核心',
-    badgeColor: 'indigo',
-  },
-  {
-    key: 'reviewModel',
-    label: '复习出题',
-    icon: Brain,
-    description: '用于根据 FSRS 算法生成个性化复习题目',
-    badge: '核心',
-    badgeColor: 'indigo',
-  },
-  {
-    key: 'summaryModel',
-    label: '错题总结与分析',
-    icon: Pencil,
-    description: '用于生成错题原因分析、个性化错误归纳报告',
-    badge: '分析',
-    badgeColor: 'amber',
-  },
-  {
-    key: 'translationModel',
-    label: '翻译与语言处理',
-    icon: Languages,
-    description: '用于英语等外语内容的翻译和语言辅助功能',
-    badge: '辅助',
-    badgeColor: 'emerald',
-  },
-  {
-    key: 'ragModel',
-    label: 'RAG 知识检索增强',
-    icon: Search,
-    description: '用于基于课本和记忆库进行语义搜索与关联召回',
-    badge: '检索',
-    badgeColor: 'cyan',
-  },
-  {
-    key: 'embeddingModel',
-    label: '文本向量化 (Embedding)',
-    icon: Zap,
-    description: '用于将知识点转换为向量，支撑语义搜索能力',
-    badge: '基础',
-    badgeColor: 'slate',
-    isEmbedding: true,
+    id: 'advanced',
+    title: '高级自定义',
+    description: '保留原有 provider / model 粒度，适合你后续专项调参。',
+    highlights: ['完全自定义', '保留老能力', '配置更复杂'],
   },
 ];
 
-const BADGE_COLORS: Record<string, string> = {
-  indigo: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20',
-  amber: 'bg-amber-500/10 text-amber-400 border border-amber-500/20',
-  emerald: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',
-  cyan: 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20',
-  slate: 'bg-slate-500/10 text-slate-400 border border-slate-600/20',
-};
+const ADVANCED_FIELDS = [
+  { key: 'parseModel', label: '录入解析模型', icon: Sparkles },
+  { key: 'chatModel', label: '问答模型', icon: Brain },
+  { key: 'graphModel', label: '导图建议模型', icon: Network },
+  { key: 'reviewModel', label: '复习与总结模型', icon: Cpu },
+  { key: 'embeddingModel', label: 'Embedding 模型', icon: Search },
+] as const;
+
+type AdvancedFieldKey = (typeof ADVANCED_FIELDS)[number]['key'];
+
+const BUILTIN_GENERATION_MODELS = [
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+  { value: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash Lite' },
+];
+
+const BUILTIN_EMBEDDINGS = [
+  { value: 'text-embedding-004', label: 'text-embedding-004' },
+  { value: 'gemini-embedding-2-preview', label: 'gemini-embedding-2-preview' },
+];
+
+function applyPreset(preset: AIPreset) {
+  if (preset === 'quality') {
+    return {
+      aiPreset: preset,
+      parseModel: 'gemini-3.1-pro-preview',
+      chatModel: 'gemini-3.1-pro-preview',
+      graphModel: 'gemini-3.1-pro-preview',
+      reviewModel: 'gemini-3.1-pro-preview',
+      embeddingModel: 'text-embedding-004',
+      rerankMode: 'hybrid-only' as const,
+      rerankTopN: 8,
+    };
+  }
+
+  if (preset === 'balanced') {
+    return {
+      aiPreset: preset,
+      parseModel: 'gemini-3-flash-preview',
+      chatModel: 'gemini-3-flash-preview',
+      graphModel: 'gemini-3-flash-preview',
+      reviewModel: 'gemini-3-flash-preview',
+      embeddingModel: 'text-embedding-004',
+      rerankMode: 'hybrid-only' as const,
+      rerankTopN: 8,
+    };
+  }
+
+  return {
+    aiPreset: 'advanced' as const,
+  };
+}
 
 export default function ModelAllocationSettings() {
   const { state, dispatch } = useAppContext();
+  const preset = state.settings.aiPreset || 'balanced';
+  const [showAdvancedPanel, setShowAdvancedPanel] = useState(preset === 'advanced');
+  const presetExamples = useMemo(
+    () => (preset === 'advanced' ? null : getPresetExampleModels(preset)),
+    [preset]
+  );
 
-  const updateSetting = (key: string, value: string) => {
-    dispatch({ type: 'UPDATE_SETTINGS', payload: { [key]: value } });
-  };
+  const customOptions =
+    state.settings.customProviders?.flatMap((provider) =>
+      (provider.models || []).map((model) => ({
+        value: `${provider.id}:${model.id}`,
+        label: `${provider.name} · ${model.name || model.id}`,
+      }))
+    ) || [];
 
-  const getAllModels = (isEmbedding = false) => {
-    const builtInOptions = isEmbedding
-      ? [{ value: 'gemini-embedding-2-preview', label: 'Gemini Embedding 2', group: 'Google (内置)' }]
-      : [
-          { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash', group: 'Google (内置)' },
-          { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro', group: 'Google (内置)' },
-          { value: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash Lite', group: 'Google (内置)' },
-        ];
-
-    const customOptions =
-      state.settings.customProviders?.flatMap((p) =>
-        p.models
-          .filter((m) =>
-            isEmbedding
-              ? m.id.toLowerCase().includes('embed')
-              : !m.id.toLowerCase().includes('embed')
-          )
-          .map((m) => ({
-            value: `${p.id}:${m.id}`,
-            label: m.name || m.id,
-            group: p.name,
-          }))
-      ) ?? [];
-
-    return { builtIn: builtInOptions, custom: customOptions };
-  };
-
-  const renderSelect = (taskKey: string, isEmbedding = false) => {
-    const settingKey = taskKey as keyof typeof state.settings;
-    const currentValue = (state.settings[settingKey] as string) || (isEmbedding ? 'gemini-embedding-2-preview' : 'gemini-3-flash-preview');
-    const { builtIn, custom } = getAllModels(isEmbedding);
-
-    return (
-      <select
-        value={currentValue}
-        onChange={(e) => updateSetting(settingKey, e.target.value)}
-        className="w-full p-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none text-slate-200 cursor-pointer transition-colors"
-      >
-        <optgroup label="Google (内置)">
-          {builtIn.map((o) => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
-        </optgroup>
-        {custom.length > 0 && (
-          <optgroup label="自定义供应商">
-            {custom.map((o) => (
-              <option key={o.value} value={o.value}>[{o.group}] {o.label}</option>
-            ))}
-          </optgroup>
-        )}
-      </select>
-    );
+  const updateField = (key: AdvancedFieldKey, value: string) => {
+    const payload = { [key]: value } as Partial<Pick<Settings, AdvancedFieldKey>>;
+    dispatch({ type: 'UPDATE_SETTINGS', payload });
   };
 
   return (
-    <div className="space-y-4 animate-in fade-in duration-300">
-      {/* Header hint */}
-      <div className="flex items-center gap-2 p-3 bg-indigo-500/5 border border-indigo-500/20 rounded-xl">
-        <Cpu className="w-4 h-4 text-indigo-400 shrink-0" />
-        <p className="text-xs text-slate-400">
-          为每个 AI 任务单独指定最合适的模型。<span className="text-indigo-400">自定义供应商</span>需在「AI 供应商」侧先完成配置。
-        </p>
-      </div>
+    <div className="space-y-5 animate-in fade-in duration-300">
+      <section className="rounded-2xl border border-indigo-500/20 bg-indigo-500/5 p-4">
+        <div className="flex items-start gap-3">
+          <Sparkles className="mt-0.5 h-4 w-4 text-indigo-400 shrink-0" />
+          <div className="space-y-1">
+            <h3 className="text-sm font-semibold text-slate-100">默认只保留三档预设</h3>
+            <p className="text-xs text-slate-400">
+              首版统一走“图谱范围过滤 → dense+sparse 混合召回 → 直接回答”，默认关闭复杂 rerank / late interaction。
+            </p>
+          </div>
+        </div>
+      </section>
 
-      {/* Task cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {TASK_CONFIGS.map((task) => {
-          const Icon = task.icon;
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        {PRESET_CARDS.map((card) => {
+          const selected = preset === card.id;
           return (
-            <div
-              key={task.key}
-              className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 hover:border-slate-700 transition-colors"
+            <button
+              key={card.id}
+              type="button"
+              onClick={() => {
+                dispatch({ type: 'UPDATE_SETTINGS', payload: applyPreset(card.id as AIPreset) });
+                if (card.id !== 'advanced') setShowAdvancedPanel(false);
+              }}
+              className={[
+                'rounded-2xl border p-4 text-left transition-all',
+                selected
+                  ? 'border-indigo-500/40 bg-indigo-500/10 shadow-lg shadow-indigo-900/10'
+                  : 'border-slate-800 bg-slate-900 hover:border-slate-700',
+              ].join(' ')}
             >
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 bg-slate-800 rounded-lg flex items-center justify-center shrink-0">
-                    <Icon className="w-4 h-4 text-slate-300" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold text-slate-200">{task.label}</p>
-                    <p className="text-[10px] text-slate-500 mt-0.5 leading-tight">{task.description}</p>
-                  </div>
-                </div>
-                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 ${BADGE_COLORS[task.badgeColor]}`}>
-                  {task.badge}
-                </span>
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-slate-100">{card.title}</h3>
+                {selected && <span className="rounded-full bg-indigo-500/20 px-2 py-0.5 text-[10px] text-indigo-200">当前</span>}
               </div>
-              {renderSelect(task.key, task.isEmbedding)}
-            </div>
+              <p className="mt-2 text-xs leading-5 text-slate-400">{card.description}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {card.highlights.map((item) => (
+                  <span key={item} className="rounded-full border border-slate-700 bg-slate-950 px-2 py-0.5 text-[10px] text-slate-400">
+                    {item}
+                  </span>
+                ))}
+              </div>
+            </button>
           );
         })}
       </div>
+
+      {preset !== 'advanced' && presetExamples && (
+        <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4 space-y-2">
+          <h3 className="text-sm font-semibold text-slate-100">当前预设说明</h3>
+          <p className="text-xs text-slate-400">零配置默认使用内置 Gemini 组合，保证开箱即用。</p>
+          <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 text-xs text-slate-300">
+            <div>内置组合：{presetExamples.builtin}</div>
+            <div className="mt-1 text-slate-500">可替代示例：{presetExamples.optional}</div>
+          </div>
+        </section>
+      )}
+
+      <section className="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+        <button
+          type="button"
+          onClick={() => setShowAdvancedPanel((value) => !value)}
+          className="flex w-full items-center justify-between text-left"
+        >
+          <div>
+            <h3 className="text-sm font-semibold text-slate-100">高级自定义面板</h3>
+            <p className="mt-1 text-xs text-slate-500">
+              仅在需要细调 provider / model 时打开；日常使用建议保持预设模式。
+            </p>
+          </div>
+          {showAdvancedPanel ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+        </button>
+
+        {showAdvancedPanel && (
+          <div className="mt-4 space-y-4 border-t border-slate-800 pt-4">
+            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-100">
+              打开高级模式后，你可以继续使用原有 provider 模型；但首版默认效果已针对预设做过简化。
+            </div>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              {ADVANCED_FIELDS.map((field) => {
+                const Icon = field.icon;
+                const options = field.key === 'embeddingModel' ? BUILTIN_EMBEDDINGS : BUILTIN_GENERATION_MODELS;
+                return (
+                  <div key={field.key} className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                    <div className="mb-2 flex items-center gap-2 text-sm text-slate-200">
+                      <Icon className="h-4 w-4 text-slate-400" />
+                      {field.label}
+                    </div>
+                    <select
+                      value={state.settings[field.key] || ''}
+                      onChange={(event) => {
+                        dispatch({ type: 'UPDATE_SETTINGS', payload: { aiPreset: 'advanced' } });
+                        updateField(field.key, event.target.value);
+                      }}
+                      className="w-full rounded-xl border border-slate-800 bg-slate-900 p-2.5 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                    >
+                      {options.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                      {customOptions.length > 0 && <option disabled>────────</option>}
+                      {customOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

@@ -1,5 +1,6 @@
-import { GoogleGenAI, Type, FunctionDeclaration, ThinkingLevel } from '@google/genai';
+﻿import { GoogleGenAI, Type, FunctionDeclaration, ThinkingLevel } from '@google/genai';
 import { 
+  AIPreset,
   Memory, 
   KnowledgeNode, 
   Subject, 
@@ -9,16 +10,85 @@ import {
   CustomModel,
   Textbook,
   TextbookPage,
+  TextbookQuizConfig,
+  TextbookQuizQuestion,
   ReviewPlan,
   ReviewPlanItem
 } from './types';
 import { searchRetrieval } from './retrieval/client';
-import { buildChatPrompt } from './prompting';
+import { buildChatPrompt, buildIngestionPrompt } from './prompting';
+import { findTextbookSection, getPageRangeForSection, getPagesForQuizScope, getSectionMastery, normalizeTextbookForState } from './textbook';
 
 // ... (existing imports)
 
 // Helper to get the global AI instance
 let globalAiInstance: GoogleGenAI | null = null;
+
+interface TextbookSearchScope {
+  textbookId?: string;
+  sectionId?: string;
+  pageStart?: number;
+  pageEnd?: number;
+}
+
+const PRESET_MODEL_BUNDLES: Record<Exclude<AIPreset, 'advanced'>, Partial<Settings>> = {
+  quality: {
+    parseModel: 'gemini-3.1-pro-preview',
+    chatModel: 'gemini-3.1-pro-preview',
+    graphModel: 'gemini-3.1-pro-preview',
+    reviewModel: 'gemini-3.1-pro-preview',
+    embeddingModel: 'text-embedding-004',
+    rerankMode: 'hybrid-only',
+    rerankTopN: 8,
+  },
+  balanced: {
+    parseModel: 'gemini-3-flash-preview',
+    chatModel: 'gemini-3-flash-preview',
+    graphModel: 'gemini-3-flash-preview',
+    reviewModel: 'gemini-3-flash-preview',
+    embeddingModel: 'text-embedding-004',
+    rerankMode: 'hybrid-only',
+    rerankTopN: 8,
+  },
+};
+
+export function resolveAIPresetSettings(settings: Settings): Settings {
+  const preset = settings.aiPreset || 'balanced';
+  if (preset === 'advanced') return settings;
+  return {
+    ...settings,
+    ...PRESET_MODEL_BUNDLES[preset],
+    rerankerProvider: undefined,
+    lateInteractionProvider: undefined,
+  };
+}
+
+export function getPresetExampleModels(preset: Exclude<AIPreset, 'advanced'>) {
+  if (preset === 'quality') {
+    return {
+      builtin: 'Gemini 3.1 Pro + text-embedding-004',
+      optional: 'GPT-5.4-mini / Gemini 2.5 Pro + text-embedding-3-large / gemini-embedding-001',
+    };
+  }
+
+  return {
+    builtin: 'Gemini 3 Flash + text-embedding-004',
+    optional: 'Gemini 2.5 Flash / GPT-5.4-mini + text-embedding-3-small / gemini-embedding-001',
+  };
+}
+
+export function inferModelProvider(modelId: string, settings?: Settings) {
+  if (!modelId) return 'unknown';
+  if (modelId.includes(':')) {
+    const providerId = modelId.split(':')[0];
+    const provider = settings?.customProviders?.find((item) => item.id === providerId);
+    return provider?.name || providerId;
+  }
+  if (/gpt|text-embedding/i.test(modelId)) return 'OpenAI';
+  if (/gemini/i.test(modelId)) return 'Google';
+  return 'builtin';
+}
+
 function getGlobalAI() {
   if (!globalAiInstance) {
     const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
@@ -46,8 +116,9 @@ export async function getEmbedding(
   content: string | { data: string, mimeType: string } | (string | { inlineData: { data: string, mimeType: string } })[],
   settings?: Settings
 ): Promise<number[]> {
-  const modelId = settings?.embeddingModel || 'text-embedding-004';
-  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(modelId, settings || {} as Settings);
+  const effectiveSettings = resolveAIPresetSettings(settings || {} as Settings);
+  const modelId = effectiveSettings?.embeddingModel || 'text-embedding-004';
+  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(modelId, effectiveSettings);
 
   let contents: any[];
   if (Array.isArray(content)) {
@@ -299,6 +370,48 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
   return dotProduct / (Math.sqrt(mA) * Math.sqrt(mB));
 }
 
+function isPageInScope(
+  textbook: Textbook,
+  page: TextbookPage,
+  scope?: TextbookSearchScope
+) {
+  if (!scope) return true;
+  if (scope.textbookId && textbook.id !== scope.textbookId) return false;
+  if (scope.pageStart && page.pageNumber < scope.pageStart) return false;
+  if (scope.pageEnd && page.pageNumber > scope.pageEnd) return false;
+  if (scope.sectionId && !(page.sectionIds || []).includes(scope.sectionId)) return false;
+  return true;
+}
+
+function buildTextbookScopeLabel(textbook: Textbook, scope?: TextbookSearchScope) {
+  if (!scope) return `${textbook.name} 全书`;
+  if (scope.sectionId) {
+    const section = findTextbookSection(textbook.toc || [], scope.sectionId);
+    if (section) return `${textbook.name} · ${section.title}`;
+  }
+  if (scope.pageStart || scope.pageEnd) {
+    return `${textbook.name} · 第 ${scope.pageStart || 1}-${scope.pageEnd || textbook.totalPages || textbook.pages.length} 页`;
+  }
+  return `${textbook.name} 全书`;
+}
+
+function buildTextbookExcerpt(pages: TextbookPage[], limit = 2400) {
+  const chunks: string[] = [];
+  let size = 0;
+  for (const page of pages) {
+    const block = `【第 ${page.pageNumber} 页】\n${page.content}`.trim();
+    if (!block) continue;
+    if (size + block.length > limit && chunks.length > 0) break;
+    chunks.push(block);
+    size += block.length;
+  }
+  return chunks.join('\n\n');
+}
+
+function uniq<T>(items: T[]): T[] {
+  return Array.from(new Set(items));
+}
+
 /**
  * Search textbooks for relevant pages
  */
@@ -306,7 +419,8 @@ export async function searchTextbooks(
   query: string,
   textbooks: Textbook[],
   settings: Settings,
-  limit: number = 3
+  limit: number = 3,
+  scope?: TextbookSearchScope
 ): Promise<{ page: TextbookPage; textbookId: string; textbookName: string; score: number }[]> {
   if (settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
     try {
@@ -320,7 +434,7 @@ export async function searchTextbooks(
         .map((hit) => {
           const textbook = textbooks.find((item) => item.id === hit.document.sourceTextbookId);
           const page = textbook?.pages.find((item) => item.pageNumber === hit.document.sourceTextbookPage);
-          if (!textbook || !page) return null;
+          if (!textbook || !page || !isPageInScope(textbook, page, scope)) return null;
           return { page, textbookId: textbook.id, textbookName: textbook.name, score: hit.score };
         })
         .filter(Boolean)
@@ -335,7 +449,7 @@ export async function searchTextbooks(
 
   for (const textbook of textbooks) {
     for (const page of textbook.pages) {
-      if (page.embedding) {
+      if (page.embedding && isPageInScope(textbook, page, scope)) {
         const score = cosineSimilarity(queryEmbedding, page.embedding);
         results.push({ page, textbookId: textbook.id, textbookName: textbook.name, score });
       }
@@ -353,15 +467,18 @@ export async function searchMemoriesRAG(
   memories: Memory[],
   settings: Settings,
   limit: number = 5,
-  base64Image?: string
+  base64Image?: string,
+  scopeNodeIds?: string[]
 ): Promise<Memory[]> {
-  if (!base64Image && settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
+  const effectiveSettings = resolveAIPresetSettings(settings);
+  if (!base64Image && effectiveSettings.serverBackend === 'server-qdrant' && effectiveSettings.syncKey?.trim()) {
     try {
       const { hits } = await searchRetrieval({
         query,
-        syncKey: settings.syncKey.trim(),
+        syncKey: effectiveSettings.syncKey.trim(),
         subject: memories[0]?.subject,
-        settings,
+        nodeIds: scopeNodeIds,
+        settings: effectiveSettings,
       });
       const orderedMemoryIds = hits
         .filter((hit) => hit.document.kind === 'memory')
@@ -395,7 +512,7 @@ export async function searchMemoriesRAG(
     return [];
   }
 
-  const queryEmbedding = await getEmbedding(embeddingInput, settings);
+  const queryEmbedding = await getEmbedding(embeddingInput, effectiveSettings);
   const results: { memory: Memory; score: number }[] = [];
 
   for (const memory of memories) {
@@ -420,15 +537,19 @@ export async function searchAllRAG(
   textbooks: Textbook[],
   settings: Settings,
   limit: number = 5,
-  base64Image?: string
+  base64Image?: string,
+  scopeNodeIds?: string[],
+  textbookScope?: TextbookSearchScope
 ): Promise<{ type: 'memory' | 'textbook'; item: any; score: number }[]> {
-  if (!base64Image && settings.serverBackend === 'server-qdrant' && settings.syncKey?.trim()) {
+  const effectiveSettings = resolveAIPresetSettings(settings);
+  if (!base64Image && effectiveSettings.serverBackend === 'server-qdrant' && effectiveSettings.syncKey?.trim()) {
     try {
       const { hits } = await searchRetrieval({
         query,
-        syncKey: settings.syncKey.trim(),
+        syncKey: effectiveSettings.syncKey.trim(),
         subject: memories[0]?.subject,
-        settings,
+        nodeIds: scopeNodeIds,
+        settings: effectiveSettings,
       });
       return hits
         .map((hit) => {
@@ -440,7 +561,7 @@ export async function searchAllRAG(
           if (hit.document.kind === 'textbook_page') {
             const textbook = textbooks.find((item) => item.id === hit.document.sourceTextbookId);
             const page = textbook?.pages.find((item) => item.pageNumber === hit.document.sourceTextbookPage);
-            if (!textbook || !page) return null;
+            if (!textbook || !page || !isPageInScope(textbook, page, textbookScope)) return null;
             return {
               type: 'textbook' as const,
               item: { textbookId: textbook.id, textbookName: textbook.name, ...page },
@@ -489,7 +610,7 @@ export async function searchAllRAG(
 
   for (const textbook of textbooks) {
     for (const page of textbook.pages) {
-      if (page.embedding) {
+      if (page.embedding && isPageInScope(textbook, page, textbookScope)) {
         const score = cosineSimilarity(queryEmbedding, page.embedding);
         results.push({ type: 'textbook', item: { textbookId: textbook.id, textbookName: textbook.name, ...page }, score });
       }
@@ -497,6 +618,209 @@ export async function searchAllRAG(
   }
 
   return results.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+function buildScopedTextbookPages(textbook: Textbook, scope?: { sectionId?: string; pageRange?: { start: number; end: number } }) {
+  const normalized = normalizeTextbookForState(textbook);
+  if (scope?.sectionId) {
+    const range = getPageRangeForSection(normalized.toc || [], scope.sectionId, normalized.totalPages);
+    return normalized.pages.filter((page) => page.pageNumber >= range.start && page.pageNumber <= range.end);
+  }
+  if (scope?.pageRange) {
+    return normalized.pages.filter(
+      (page) => page.pageNumber >= scope.pageRange!.start && page.pageNumber <= scope.pageRange!.end
+    );
+  }
+  return normalized.pages;
+}
+
+export function buildTextbookAssessmentContext(params: {
+  textbook: Textbook;
+  memories: Memory[];
+  knowledgeNodes: KnowledgeNode[];
+  sectionId?: string;
+  pageRange?: { start: number; end: number };
+}) {
+  const normalized = normalizeTextbookForState(params.textbook);
+  const scopedPages = buildScopedTextbookPages(normalized, {
+    sectionId: params.sectionId,
+    pageRange: params.pageRange,
+  });
+  const scopedPageNumbers = new Set(scopedPages.map((page) => page.pageNumber));
+  const textbookMemories = params.memories.filter((memory) => {
+    if (memory.subject !== normalized.subject) return false;
+    if (memory.sourceTextbookId === normalized.id && scopedPageNumbers.has(memory.sourceTextbookPage || -1)) return true;
+    return false;
+  });
+  const scopedNodeIds = uniq(
+    textbookMemories.flatMap((memory) => memory.knowledgeNodeIds || [])
+  );
+  const weakNodes = params.knowledgeNodes
+    .filter((node) => node.subject === normalized.subject && scopedNodeIds.includes(node.id))
+    .slice(0, 6);
+
+  return {
+    label: buildTextbookScopeLabel(normalized, {
+      textbookId: normalized.id,
+      sectionId: params.sectionId,
+      pageStart: params.pageRange?.start,
+      pageEnd: params.pageRange?.end,
+    }),
+    pages: scopedPages,
+    relatedMemories: textbookMemories,
+    relatedMistakes: textbookMemories.filter((memory) => memory.isMistake),
+    weakNodes,
+  };
+}
+
+export async function generateTextbookStudyGuide(
+  textbook: Textbook,
+  settings: Settings,
+  options: {
+    sectionId?: string;
+    pageRange?: { start: number; end: number };
+    memories?: Memory[];
+    knowledgeNodes?: KnowledgeNode[];
+  },
+  logCallback?: (log: any) => void
+): Promise<string> {
+  const normalized = normalizeTextbookForState(textbook);
+  const context = buildTextbookAssessmentContext({
+    textbook: normalized,
+    memories: options.memories || [],
+    knowledgeNodes: options.knowledgeNodes || [],
+    sectionId: options.sectionId,
+    pageRange: options.pageRange,
+  });
+  const excerpt = buildTextbookExcerpt(context.pages, 2800);
+  const mastery = options.sectionId ? getSectionMastery(normalized, options.sectionId) : 0;
+  const prompt = `你是一个高三课本伴学教练。请基于以下教材范围生成一份“章节导学”，用于带学生学习。\n\n范围：${context.label}\n当前章节掌握度估计：${mastery}/100\n相关记忆：${context.relatedMemories.length} 条\n相关错题：${context.relatedMistakes.length} 条\n相关薄弱知识点：${context.weakNodes.map((node) => node.name).join('、') || '暂无'}\n\n请输出：\n1. 本范围核心知识主线\n2. 学生最该先抓住的 3-5 个重点\n3. 容易错或容易混淆的地方\n4. 建议学习顺序（先读哪里，再练哪里）\n5. 最后给出 3 个适合继续追问 AI 的问题\n\n教材内容：\n${excerpt || '当前范围没有可用文本，请基于章节标题给出保守导学。'}`;
+
+  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.chatModel, settings);
+  let result = '';
+  if (isCustomOpenAI && customModel) {
+    result = await fetchOpenAI(customModel, prompt);
+  } else if (client) {
+    const response = await client.models.generateContent({
+      model: modelName,
+      contents: prompt,
+    });
+    result = response.text || '暂时无法生成导学内容。';
+  } else {
+    throw new Error('AI client not initialized');
+  }
+
+  if (logCallback) {
+    logCallback({
+      type: 'chat',
+      model: settings.chatModel,
+      prompt: `[Textbook Study Guide] ${context.label}`,
+      response: result,
+    });
+  }
+
+  return result;
+}
+
+export async function generateTextbookQuiz(
+  textbook: Textbook,
+  settings: Settings,
+  quizConfig: TextbookQuizConfig,
+  options?: {
+    memories?: Memory[];
+    knowledgeNodes?: KnowledgeNode[];
+  },
+  logCallback?: (log: any) => void
+): Promise<TextbookQuizQuestion[]> {
+  const normalized = normalizeTextbookForState(textbook);
+  const context = buildTextbookAssessmentContext({
+    textbook: normalized,
+    memories: options?.memories || [],
+    knowledgeNodes: options?.knowledgeNodes || [],
+    sectionId: quizConfig.sectionId,
+    pageRange: quizConfig.pageRange,
+  });
+  const scopedPages = getPagesForQuizScope(normalized, quizConfig);
+  const excerpt = buildTextbookExcerpt(scopedPages, 3200);
+  const mastery = quizConfig.sectionId ? getSectionMastery(normalized, quizConfig.sectionId) : 0;
+
+  const prompt = `你是一个高效的教材出题助手。请基于以下教材范围出 5 道题，用于快速检测学生掌握情况。\n\n范围：${context.label}\n深度：${quizConfig.depth}\n是否按掌握度自适应：${quizConfig.adaptive ? '是' : '否'}\n当前掌握度估计：${mastery}/100\n题型限制：${quizConfig.questionTypes.join('、')}\n相关错题：${context.relatedMistakes.length} 条\n相关薄弱知识点：${context.weakNodes.map((node) => node.name).join('、') || '暂无'}\n\n要求：\n- 以单选题、判断题为主\n- 优先覆盖教材主干概念、易错点和易混点\n- 如果有相关错题/薄弱点，则至少有 2 题联合考察\n- 题目难度要短平快，适合高频自测\n- 返回 JSON 数组，每题包含 id, type, prompt, options, answer, explanation, relatedPageNumbers, relatedSectionIds, source\n\n教材内容：\n${excerpt || '当前范围没有足够文本，请根据章节标题生成保守题目。'}`;
+
+  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.reviewModel, settings);
+  let resultStr = '[]';
+  if (isCustomOpenAI && customModel) {
+    resultStr = await fetchOpenAI(customModel, prompt);
+  } else if (client) {
+    const response = await client.models.generateContent({
+      model: modelName,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              id: { type: Type.STRING },
+              type: { type: Type.STRING },
+              prompt: { type: Type.STRING },
+              options: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              answer: { type: Type.STRING },
+              explanation: { type: Type.STRING },
+              relatedPageNumbers: {
+                type: Type.ARRAY,
+                items: { type: Type.NUMBER }
+              },
+              relatedSectionIds: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING }
+              },
+              source: { type: Type.STRING }
+            },
+            required: ['id', 'type', 'prompt', 'answer', 'source']
+          }
+        }
+      }
+    });
+    resultStr = response.text || '[]';
+  } else {
+    throw new Error('AI client not initialized');
+  }
+
+  if (logCallback) {
+    logCallback({
+      type: 'review',
+      model: settings.reviewModel,
+      prompt: `[Textbook Quiz] ${context.label}`,
+      response: resultStr,
+    });
+  }
+
+  try {
+    const parsed = JSON.parse(resultStr);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item, index) => ({
+      id: item.id || `quiz-${index + 1}`,
+      type: item.type === 'true_false' ? 'true_false' : 'single_choice',
+      prompt: item.prompt || `第 ${index + 1} 题`,
+      options: Array.isArray(item.options) ? item.options : undefined,
+      answer: item.answer || '',
+      explanation: item.explanation,
+      relatedPageNumbers: Array.isArray(item.relatedPageNumbers) ? item.relatedPageNumbers : scopedPages.slice(0, 2).map((page) => page.pageNumber),
+      relatedSectionIds: Array.isArray(item.relatedSectionIds)
+        ? item.relatedSectionIds
+        : quizConfig.sectionId
+          ? [quizConfig.sectionId]
+          : undefined,
+      source: item.source === 'hybrid' ? 'hybrid' : 'textbook',
+    }));
+  } catch (error) {
+    console.error('Failed to parse textbook quiz result', error);
+    return [];
+  }
 }
 
 /**
@@ -611,6 +935,22 @@ export const searchTextbookTool: FunctionDeclaration = {
       query: {
         type: Type.STRING,
         description: "搜索关键词或描述性语句"
+      },
+      textbookId: {
+        type: Type.STRING,
+        description: "可选，限定某一本课本。"
+      },
+      sectionId: {
+        type: Type.STRING,
+        description: "可选，限定某个课本章节。"
+      },
+      pageStart: {
+        type: Type.NUMBER,
+        description: "可选，限定起始页码。"
+      },
+      pageEnd: {
+        type: Type.NUMBER,
+        description: "可选，限定结束页码。"
       }
     },
     required: ["query"]
@@ -626,6 +966,22 @@ export const searchAllRAGTool: FunctionDeclaration = {
       query: {
         type: Type.STRING,
         description: "搜索关键词或描述内容。"
+      },
+      textbookId: {
+        type: Type.STRING,
+        description: "可选，限定某一本课本。"
+      },
+      sectionId: {
+        type: Type.STRING,
+        description: "可选，限定某个课本章节。"
+      },
+      pageStart: {
+        type: Type.NUMBER,
+        description: "可选，限定起始页码。"
+      },
+      pageEnd: {
+        type: Type.NUMBER,
+        description: "可选，限定结束页码。"
       }
     },
     required: ["query"]
@@ -706,7 +1062,12 @@ export function getAIClient(modelId: string, settings: Settings) {
 /**
  * Fetch from OpenAI-compatible API
  */
-async function fetchOpenAI(customModel: CustomModel, prompt: string, base64Image?: string, responseFormat?: 'json_object') {
+async function fetchOpenAI(
+  customModel: CustomModel,
+  prompt: string,
+  base64Image?: string,
+  responseFormat?: 'json_object' | 'json_array'
+) {
   const messages: any[] = [
     {
       role: 'user',
@@ -838,6 +1199,52 @@ function normalizeStringArray(value: unknown): string[] {
   return normalized ? [normalized] : [];
 }
 
+function normalizeConfidenceValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value <= 1 ? Math.round(value * 100) : Math.round(value);
+  if (typeof value === 'string') {
+    const parsed = Number(value.replace('%', '').trim());
+    if (Number.isFinite(parsed)) return parsed <= 1 ? Math.round(parsed * 100) : Math.round(parsed);
+  }
+  return undefined;
+}
+
+function normalizeStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([key, val]) => [key.trim(), normalizeAIText(val)] as const)
+    .filter(([key, val]) => key.length > 0 && val.length > 0);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function normalizeEvidence(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const normalized = {
+    sourceText: normalizeAIText(record.sourceText) || undefined,
+    locationHint: normalizeAIText(record.locationHint) || undefined,
+    keySentence: normalizeAIText(record.keySentence) || undefined,
+  };
+  return normalized.sourceText || normalized.locationHint || normalized.keySentence ? normalized : undefined;
+}
+
+function normalizeMemoryCard(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const normalized = {
+    front: normalizeAIText(record.front) || undefined,
+    back: normalizeAIText(record.back) || undefined,
+  };
+  return normalized.front || normalized.back ? normalized : undefined;
+}
+
+function normalizeReviewPriority(value: unknown): 'high' | 'medium' | 'low' | 'summary_only' | undefined {
+  const normalized = normalizeAIText(value).toLowerCase();
+  if (normalized === 'high' || normalized === 'medium' || normalized === 'low' || normalized === 'summary_only') {
+    return normalized;
+  }
+  return undefined;
+}
+
 function normalizeBoolean(value: unknown): boolean {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
@@ -860,6 +1267,8 @@ function normalizeVocabularyData(value: unknown) {
     usage: normalizeAIText(record.usage) || undefined,
     mnemonics: normalizeAIText(record.mnemonics) || undefined,
     synonyms: Array.from(new Set(normalizeStringArray(record.synonyms))),
+    originalSentence: normalizeAIText(record.originalSentence) || undefined,
+    confusions: Array.from(new Set(normalizeStringArray(record.confusions))),
   };
 
   if (
@@ -867,7 +1276,9 @@ function normalizeVocabularyData(value: unknown) {
     !normalized.meaning &&
     !normalized.usage &&
     !normalized.mnemonics &&
-    normalized.synonyms.length === 0
+    normalized.synonyms.length === 0 &&
+    !normalized.originalSentence &&
+    normalized.confusions.length === 0
   ) {
     return undefined;
   }
@@ -934,17 +1345,33 @@ function normalizeParsedItem(value: unknown) {
       '',
     type:
       type ||
-      (normalizeAIText(record.correctAnswer) || normalizeAIText(record.questionType) || normalizeBoolean(record.isMistake)
+      (normalizeAIText(record.correctAnswer) ||
+      normalizeAIText(record.questionType) ||
+      normalizeAIText(record.questionNo) ||
+      normalizeAIText(record.studentAnswer) ||
+      normalizeBoolean(record.isMistake)
         ? ('qa' as const)
         : ('concept' as const)),
+    questionNo: normalizeAIText(record.questionNo) || undefined,
     correctAnswer: normalizeAIText(record.correctAnswer) || undefined,
     questionType: normalizeAIText(record.questionType) || undefined,
+    studentAnswer: normalizeAIText(record.studentAnswer) || undefined,
     suggestedNodeIds: Array.from(new Set(normalizeStringArray(record.suggestedNodeIds))),
     newNodes: normalizeSuggestedNodes(record.newNodes),
     deletedNodeIds: Array.from(new Set(normalizeStringArray(record.deletedNodeIds))),
     isMistake: normalizeBoolean(record.isMistake),
     wrongAnswer: normalizeAIText(record.wrongAnswer) || undefined,
+    confidence: normalizeConfidenceValue(record.confidence),
+    needsConfirmation: normalizeBoolean(record.needsConfirmation),
+    conflict: normalizeBoolean(record.conflict),
     errorReason: normalizeAIText(record.errorReason) || undefined,
+    errorReasonCategory: normalizeAIText(record.errorReasonCategory) || undefined,
+    evidence: normalizeEvidence(record.evidence),
+    optionAnalysis: normalizeStringRecord(record.optionAnalysis),
+    learningTask: normalizeAIText(record.learningTask) || undefined,
+    transferExercises: Array.from(new Set(normalizeStringArray(record.transferExercises))),
+    memoryCard: normalizeMemoryCard(record.memoryCard),
+    reviewPriority: normalizeReviewPriority(record.reviewPriority),
     vocabularyData,
     notes: normalizeAIText(record.notes) || undefined,
     visualDescription: normalizeAIText(record.visualDescription) || undefined,
@@ -979,103 +1406,35 @@ export async function parseNotes(
   existingPurposeTypes: string[] = ['内化型', '记忆型', '补充知识型', '系统型'],
   logCallback?: (log: any) => void
 ): Promise<{ analysisProcess: string; parsedItems: any[]; newNodes: KnowledgeNode[]; deletedNodeIds: string[]; identifiedSubject: string }> {
-  // Strict Subject Isolation
+  const effectiveSettings = resolveAIPresetSettings(settings);
+  const parseModel = settings.parseModel || effectiveSettings.parseModel;
   const subjectNodes = allNodes.filter(n => n.subject === subject);
-  const feedbackDirective = `
-AI attention notes:
-${settings.aiAttentionNotes || 'None.'}
-
-Feedback-derived preferences:
-${settings.feedbackLearningNotes || 'None.'}
-`;
-
-  let prompt = `
-${feedbackDirective}
-你是一个高考复习与错题本AI助手。请分析以下学生的作业/笔记/试卷内容（可能包含文本或多张图片/PDF/Word内容）。
-当前用户选择的科目：【${subject}】
-
-【重要：科目隔离】
-请严格只在【${subject}】科目的范围内进行分析。如果内容明显属于其他科目，请在 identifiedSubject 中指出，但不要将其关联到当前科目的知识节点上。
-
-用户的作业与错题解析偏好（非常重要，请严格遵循）：
-${settings.homeworkPreferences || '无特殊偏好'}
-
-用户的个人符号/标记含义（请根据这些含义来识别用户的重点、疑问和错题）：
-${settings.userSymbols || '未设置。请你尝试自主推断图片中符号的含义（如红叉代表错题，五角星代表重点，问号代表疑问等）。'}
-
-【AI 自主性与整卷分析要求】：
-1. 自动识别错题：仔细扫描试卷/作业，自动发现批改痕迹（如红叉、扣分）或错误的解答，将其作为错题提取。
-2. 自动提取标记：根据用户的符号含义或你的推断，自动提取用户标记的重点、疑问点，并作为记忆卡片录入。
-3. 自动解答疑问：如果用户在题目旁画了问号或写了疑问，请在解析中自动为其详细解答，并作为记忆点录入。
-4. 整卷分析：如果上传的是整份试卷和答题卡，请综合分析错题分布，总结薄弱知识点，并提取需要记忆的核心考点。
-5. 灵活处理数据类型：区分 'concept'（概念/普通记忆）、'qa'（题目/错题）、'vocabulary'（词汇/零散语言点）。
-6. 特殊处理词汇与手写注释：对于英语阅读文章、完形填空等，请**特别注意图片中用户手写的中文注释、下划线或圈出的单词/短语（例如在单词旁写了中文意思）**。这些通常是用户不熟悉的生词或重点短语。请务必将这些词汇提取出来，类型设为 'vocabulary'，并尽可能提取上下文(context)、含义(meaning)、用法(usage)、助记(mnemonics)、同义词(synonyms)。
-
-【重要：内容纯净度要求】
-提取的 content、notes、wrongAnswer、errorReason 等字段中，必须只包含纯粹的知识点、题目或解析内容。**严禁**包含任何类似“用户让我提取...”、“根据图片显示...”、“这里是总结的...”等无关的元对话或解释性文字。直接输出核心内容。
-
-【知识图谱深度要求】：
-请尽可能详细和完整地完善知识图谱。每个知识点的考法也要录入。知识图谱的深度建议在 4-6 层。
-如果现有知识图谱不够详细，请根据题目的共性和不同点，主动建议增加更细分的子节点。
-
-${previousParsedItems ? `
-注意：这是用户要求重新生成的请求。
-之前的分析过程：
-${previousAnalysis}
-
-之前解析出的内容：
-${JSON.stringify(previousParsedItems, null, 2)}
-
-请根据用户新的补充说明/修改要求，重新生成解析结果。
-` : ''}
-
-请执行以下任务：
-1. 仔细观察图片中的笔迹、题号前的标记。
-2. 【多图处理】：如果提供了多张图片，请注意它们可能属于同一份作业或试卷，甚至同一道题目可能因为版面问题被拆分到了两张图片中。请你具备跨图片识别和整合的能力。
-3. 【技能调用】：使用 search_knowledge_graph 工具查找当前科目下相关的知识点。不要假设你了解所有节点，请先搜索。
-4. 根据用户的指令或标记，提取出需要记录的错题、独立的知识点或记忆卡片。
-5. 提供一段分析过程（analysisProcess），向用户解释你识别到了哪些标记、笔迹，以及你是如何理解用户意图的。
-6. 识别这段内容所属的科目（identifiedSubject）。
-
-对于每一个提取出的记忆/错题/词汇，请提供：
-1. content: 记忆的核心内容、题目题干或词汇本身。
-2. type: 数据类型，必须是 'concept' (概念), 'qa' (题目/错题), 或 'vocabulary' (词汇) 之一。
-3. correctAnswer: 标准答案（仅针对qa）。
-4. questionType: 题型（仅针对qa）。
-5. suggestedNodeIds: 建议关联的知识节点ID数组。请优先使用 search_knowledge_graph 找到的现有节点ID（如 "1.2.1"）。
-6. newNodes: 如果现有节点不够详细，请建议创建的新节点。
-   - name: 节点名称
-   - parentId: 父节点ID
-   - testingMethods: 该知识点的常见考法（数组，字符串列表）
-7. deletedNodeIds: 如果你发现现有节点存在冗余、错误或需要合并，请建议删除的节点ID数组。
-8. isMistake: 布尔值，标识这是否是一道错题。
-9. wrongAnswer: 如果是错题，记录用户的错误答案（如果有）。
-10. errorReason: 如果是错题，分析错误原因（例如：概念混淆、计算错误、审题不清等）。
-11. vocabularyData: 如果 type 是 'vocabulary'，请提供一个对象，包含 context (上下文原句), meaning (含义), usage (用法/搭配), mnemonics (助记方法), synonyms (同义词/近义词数组)。
-12. notes: 补充说明或正确解析。
-
-输入内容/指令：
-${input || '请分析图片中的作业和标记'}
-`;
-
-  const promptBundle = buildChatPrompt({
-    query,
+  const promptBundle = buildIngestionPrompt({
+    input,
     subject,
-    relevantMemories,
-    allNodes,
-    settings,
-    hasImage: Boolean(base64Image),
+    settings: effectiveSettings,
+    imageCount: base64Images?.length || 0,
+    previousParsedItems,
+    previousAnalysis,
+    explicitFunction,
+    explicitPurpose,
+    existingFunctionTypes,
+    existingPurposeTypes,
   });
-  prompt = promptBundle.prompt;
+  const prompt = promptBundle.prompt;
   const { promptVersion, diagnostics } = promptBundle;
+  const startedAt = Date.now();
 
-  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.parseModel, settings);
+  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(
+    parseModel,
+    effectiveSettings
+  );
 
   let response: any;
   let text = '';
   try {
     if (isCustomOpenAI && customModel) {
-      const jsonPrompt = prompt + "\n\n请以 JSON 格式返回结果，包含 analysisProcess, identifiedSubject, items (数组，包含 content, type, correctAnswer, questionType, suggestedNodeIds, newNodes, deletedNodeIds, isMistake, wrongAnswer, errorReason, vocabularyData, notes)。";
+      const jsonPrompt = `${prompt}\n\n请严格只返回 JSON，不要包含 Markdown 代码块或额外解释。`;
       text = await fetchOpenAI(customModel, jsonPrompt, base64Images?.[0], 'json_object');
       response = { text };
     } else if (client) {
@@ -1151,18 +1510,31 @@ ${input || '请分析图片中的作业和标记'}
     if (logCallback) {
       logCallback({
         type: 'parse',
-        model: settings.parseModel,
+        model: parseModel,
+        promptVersion,
         prompt: prompt,
-        response: text
+        response: text,
+        durationMs: Date.now() - startedAt,
+        metadata: {
+          ...diagnostics,
+          parseStage: 'ingestion',
+          responseChars: text.length,
+        },
       });
     }
   } catch (error: any) {
     if (logCallback) {
       logCallback({
         type: 'parse',
-        model: settings.parseModel,
+        model: parseModel,
+        promptVersion,
         prompt: prompt,
-        response: `Error: ${error.message}`
+        response: `Error: ${error.message}`,
+        durationMs: Date.now() - startedAt,
+        metadata: {
+          ...diagnostics,
+          parseStage: 'ingestion',
+        },
       });
     }
     throw error;
@@ -1512,56 +1884,40 @@ export async function chatWithAI(
   textbooks?: Textbook[],
   base64Image?: string,
   logCallback?: (log: any) => void,
-  allMemories: Memory[] = []
+  allMemories: Memory[] = [],
+  scopeContext?: {
+    nodeId?: string | null;
+    path?: string;
+    nodeIds?: string[];
+    relatedNodeIds?: string[];
+  }
 ): Promise<string> {
-  const memoryContext = relevantMemories.map(m => {
-    const nodes = m.knowledgeNodeIds.map(id => allNodes.find(n => n.id === id)?.name).filter(Boolean).join(', ');
-    let contextStr = `[记忆点] ${m.content} (分类: ${m.functionType}, 关联节点: ${nodes})`;
-    if (m.isMistake) {
-      contextStr += `\n[错题标记] 是`;
-      if (m.wrongAnswer) contextStr += `\n[原错误答案] ${m.wrongAnswer}`;
-      if (m.errorReason) contextStr += `\n[错因分析] ${m.errorReason}`;
-    }
-    if (m.visualDescription) contextStr += `\n[图片视觉描述] ${m.visualDescription}`;
-    if (m.notes) contextStr += `\n[补充说明] ${m.notes}`;
-    return contextStr;
-  }).join('\n\n');
-  const feedbackContext = `
-AI attention notes:
-${settings.aiAttentionNotes || 'None.'}
+  const effectiveSettings = resolveAIPresetSettings(settings);
+  const promptBundle = buildChatPrompt({
+    query,
+    subject,
+    relevantMemories,
+    allNodes,
+    settings: effectiveSettings,
+    hasImage: Boolean(base64Image),
+  });
+  const scopeDirective = scopeContext?.path
+    ? [
+        '',
+        '【导图作用域】',
+        `- 当前节点路径：${scopeContext.path}`,
+        `- 当前范围节点数：${scopeContext.nodeIds?.length || 0}`,
+        `- 当前相关节点数：${scopeContext.relatedNodeIds?.length || 0}`,
+        '- 如果通用知识与当前作用域冲突，优先回答当前节点/子树内的知识。',
+      ].join('\n')
+    : '';
+  const prompt = `${promptBundle.prompt}${scopeDirective}`;
+  const { promptVersion, diagnostics } = promptBundle;
 
-Feedback-derived preferences:
-${settings.feedbackLearningNotes || 'None.'}
-`;
-
-  const prompt = `
-${feedbackContext}
-你是一个极度智能、专业且具有同理心的AI辅导老师，你的目标是帮助学生深度理解知识并建立长效记忆。你的思考逻辑和表达风格应向 OpenClaw 靠近：逻辑严密、分步骤思考、善于总结、能发现知识间的深层联系。
-
-当前科目：【${subject}】
-学生当前的知识背景：
-- 个人画像：${settings.studentProfile || '普通高中生'}
-- 记忆库上下文：${relevantMemories.length > 0 ? `已检索到 ${relevantMemories.length} 条相关记忆，请结合这些记忆进行回答。` : '暂无直接相关的个人记忆。'}
-
-【核心指令】：
-1. **深度思考 (Chain of Thought)**：在回答之前，请先进行内部思考。分析问题的核心考点、学生可能的误区、以及如何将其与现有知识建立联系。
-2. **个性化回答**：如果提供了上下文记忆，请引用它们（例如：“正如你之前记录的关于...的笔记...”）。
-3. **分层讲解**：先给出直观结论，再进行原理解析，最后提供应用建议或记忆技巧。
-4. **Gateway 模式处理**：如果用户选择了特定的归纳功能（如词汇归纳、题型总结），请表现得像一个学科专家，进行系统性的梳理，而不是简单的罗列。
-5. **鼓励互动**：在回答结束时，可以提出一个启发性的问题，引导学生进一步思考。
-
-学生的问题：
-${query}
-
-以下是学生数据库中提取出的相关记忆点和错题记录（作为上下文参考）：
-${memoryContext || '暂无相关记忆。'}
-
-请结合学生的记忆点，给出专业、易懂、切中要害的解答。如果学生的记忆点中有错误或薄弱的地方，请重点指出并帮助其巩固。
-你可以使用 search_textbook 工具来查找课本上的原文定义、例题或查看课本原图。
-如果你引用了课本内容并想展示课本原图，请在回答中包含以下格式：[TEXTBOOK_PAGE: <textbookId>:<pageNumber>]，其中 <textbookId> 和 <pageNumber> 是工具返回的信息。
-`;
-
-  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.chatModel, settings);
+  const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(
+    effectiveSettings.chatModel,
+    effectiveSettings
+  );
 
   const tools = [{ 
     functionDeclarations: [
@@ -1620,7 +1976,13 @@ ${memoryContext || '暂无相关记忆。'}
             });
           } else if (fc.name === 'search_textbook') {
             const q = (fc.args as any).query;
-            const results = await searchTextbooks(q, textbooks || [], settings);
+            const scope = {
+              textbookId: (fc.args as any).textbookId,
+              sectionId: (fc.args as any).sectionId,
+              pageStart: (fc.args as any).pageStart,
+              pageEnd: (fc.args as any).pageEnd,
+            };
+            const results = await searchTextbooks(q, textbooks || [], effectiveSettings, 3, scope);
             toolResponses.push({
               name: fc.name,
               id: fc.id,
@@ -1635,7 +1997,22 @@ ${memoryContext || '暂无相关记忆。'}
             });
           } else if (fc.name === 'search_all_rag') {
             const q = (fc.args as any).query;
-            const results = await searchAllRAG(q, allMemories, textbooks || [], settings, 5, base64Image);
+            const scope = {
+              textbookId: (fc.args as any).textbookId,
+              sectionId: (fc.args as any).sectionId,
+              pageStart: (fc.args as any).pageStart,
+              pageEnd: (fc.args as any).pageEnd,
+            };
+            const results = await searchAllRAG(
+              q,
+              allMemories,
+              textbooks || [],
+              effectiveSettings,
+              5,
+              base64Image,
+              scopeContext?.nodeIds,
+              scope
+            );
             toolResponses.push({
               name: fc.name,
               id: fc.id,
@@ -1689,13 +2066,16 @@ ${memoryContext || '暂无相关记忆。'}
     if (logCallback) {
       logCallback({
         type: 'chat',
-        model: settings.chatModel,
+        model: effectiveSettings.chatModel,
         promptVersion,
         prompt,
         response: result,
         durationMs: Date.now() - startedAt,
         metadata: {
           ...diagnostics,
+          graphScopeNodeId: scopeContext?.nodeId || null,
+          graphScopePath: scopeContext?.path,
+          graphScopeNodeCount: scopeContext?.nodeIds?.length || 0,
           responseChars: result.length,
         },
       });
@@ -1704,12 +2084,17 @@ ${memoryContext || '暂无相关记忆。'}
     if (logCallback) {
       logCallback({
         type: 'chat',
-        model: settings.chatModel,
+        model: effectiveSettings.chatModel,
         promptVersion,
         prompt,
         response: `Error: ${error.message}`,
         durationMs: Date.now() - startedAt,
-        metadata: diagnostics,
+        metadata: {
+          ...diagnostics,
+          graphScopeNodeId: scopeContext?.nodeId || null,
+          graphScopePath: scopeContext?.path,
+          graphScopeNodeCount: scopeContext?.nodeIds?.length || 0,
+        },
       });
     }
     throw error;

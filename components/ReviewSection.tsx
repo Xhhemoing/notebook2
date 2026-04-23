@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react';
 import { useAppContext } from '@/lib/store';
 import { generateQuizzes, QuizQuestion } from '@/lib/ai';
-import { Memory } from '@/lib/types';
+import { Memory, ReviewEvent } from '@/lib/types';
 import { GraduationCap, Loader2, CheckCircle2, XCircle, ArrowRight, RefreshCw, Play, Layers, BookOpen, Download, CalendarDays, Target } from 'lucide-react';
 import { clsx } from 'clsx';
 import { reviewCard, Rating, Grade, calculateMetrics, createReviewEvent } from '@/lib/fsrs';
@@ -162,7 +162,7 @@ export function ReviewSection() {
     // Apply all evaluations to FSRS
     // For joint quizzes, one evaluation might apply to multiple memories
     const memoryEvaluations: Record<string, Grade[]> = {};
-    const newEvents = [];
+    const newEvents: ReviewEvent[] = [];
 
     quizzes.forEach((quiz, idx) => {
       const rating = evaluations[idx];

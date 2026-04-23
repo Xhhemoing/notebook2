@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useReducer, useEffect, useState, useRef } from 'react';
-import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict, ReviewEvent, FSRSProfile, RetrievalIndexState } from './types';
+import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict, ReviewEvent, FSRSProfile, RetrievalIndexState, GraphScope } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { deleteDB, openDB } from 'idb';
 import { evaluateMemoryQuality, MEMORY_QUALITY_RULE_VERSION, normalizeKnowledgeNodes } from './data/quality';
@@ -9,6 +9,7 @@ import { applyDataRetention, normalizeResourceRetention } from './feedback';
 import { normalizeInputHistoryItems, normalizeInputHistoryItem } from './input-history';
 import { enrichAILog } from './prompting';
 import { syncRetrievalIndex } from './retrieval/client';
+import { normalizeTextbookForState } from './textbook';
 
 const DB_NAME = 'gaokao-ai-db';
 const STORE_NAME = 'app-state';
@@ -365,6 +366,22 @@ function normalizeRetrievalIndexState(state?: Partial<RetrievalIndexState>): Ret
   };
 }
 
+function normalizeGraphScope(state: Pick<AppState, 'currentSubject' | 'knowledgeNodes'>, scope?: Partial<GraphScope> | null): GraphScope {
+  const subject = scope?.subject || state.currentSubject;
+  const nodeId = scope?.nodeId || null;
+  const node = nodeId
+    ? (state.knowledgeNodes || []).find((item) => item.id === nodeId && item.subject === subject)
+    : undefined;
+
+  return {
+    nodeId: node ? node.id : null,
+    subject,
+    includeDescendants: scope?.includeDescendants ?? true,
+    includeRelated: scope?.includeRelated ?? false,
+    updatedAt: scope?.updatedAt || Date.now(),
+  };
+}
+
 function normalizeMemoryForState(
   memory: Memory,
   validNodeIds: Set<string>,
@@ -576,9 +593,10 @@ function withDerivedLinks(state: AppState): AppState {
   const normalizedResources = (state.resources || []).map((resource) =>
     normalizeResourceRetention(resource, state.settings)
   );
+  const normalizedTextbooks = (state.textbooks || []).map((textbook) => normalizeTextbookForState(textbook));
   const validNodeIds = new Set(normalizedNodes.map((node) => node.id));
   const validResourceIds = new Set(normalizedResources.map((resource) => resource.id));
-  const validTextbookIds = new Set((state.textbooks || []).map((textbook) => textbook.id));
+  const validTextbookIds = new Set(normalizedTextbooks.map((textbook) => textbook.id));
   const normalizedMemories = (state.memories || []).map((memory) =>
     normalizeMemoryForState(memory, validNodeIds, validResourceIds, validTextbookIds)
   );
@@ -586,14 +604,19 @@ function withDerivedLinks(state: AppState): AppState {
   return {
     ...state,
     memories: normalizedMemories,
+    textbooks: normalizedTextbooks,
     resources: normalizedResources,
     knowledgeNodes: normalizedNodes,
+    activeGraphScope: normalizeGraphScope(
+      { currentSubject: state.currentSubject, knowledgeNodes: normalizedNodes },
+      state.activeGraphScope
+    ),
     links: mergeLinksWithDerived(
       state.links || [],
       normalizedMemories,
       normalizedNodes,
       normalizedResources,
-      state.textbooks || []
+      normalizedTextbooks
     )
   };
 }
@@ -609,11 +632,20 @@ const baseInitialState: AppState = {
   links: buildDerivedLinks(initialMemories, initialNodes, [], [], []),
   textbooks: [],
   reviewPlans: [],
+  activeGraphScope: {
+    nodeId: null,
+    subject: '鏁板',
+    includeDescendants: true,
+    includeRelated: false,
+    updatedAt: Date.now(),
+  },
   settings: {
+    aiPreset: 'balanced',
     parseModel: 'gemini-3-flash-preview',
     chatModel: 'gemini-3-flash-preview',
     graphModel: 'gemini-3-flash-preview',
     reviewModel: 'gemini-3-flash-preview',
+    embeddingModel: 'text-embedding-004',
     homeworkPreferences: '例如：+号代表需要加入错题本，打叉代表做错了，波浪线代表不确定的知识点。请根据这些标记进行分析。',
     studentProfile: '该学生目前处于高考复习阶段，理科基础较好，但容易在细节上出错。需要加强对基础概念的内化。',
     aiAttentionNotes: '优先保证录入准确性；当图像或上下文不完整时明确标注不确定，不要过度推断。',
@@ -631,8 +663,8 @@ const baseInitialState: AppState = {
     serverBackend: 'server-qdrant',
     fusionMode: 'dbsf',
     recallTopK: 40,
-    rerankTopN: 10,
-    rerankMode: 'cross-encoder',
+    rerankTopN: 8,
+    rerankMode: 'hybrid-only',
     fsrsDesiredRetention: 0.9,
     syncInterval: 300, // 5 minutes
     enableAutoSync: true,
@@ -653,7 +685,22 @@ const initialState: AppState = finalizeState(baseInitialState);
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case 'SET_SUBJECT':
-      return { ...state, currentSubject: action.payload };
+      return finalizeState({
+        ...state,
+        currentSubject: action.payload,
+        activeGraphScope: normalizeGraphScope(
+          { currentSubject: action.payload, knowledgeNodes: state.knowledgeNodes },
+          { nodeId: null, subject: action.payload, includeDescendants: true, includeRelated: false }
+        ),
+      });
+    case 'SET_ACTIVE_GRAPH_SCOPE':
+      return finalizeState({
+        ...state,
+        activeGraphScope: normalizeGraphScope(
+          { currentSubject: state.currentSubject, knowledgeNodes: state.knowledgeNodes },
+          action.payload
+        ),
+      });
     case 'ADD_MEMORY':
       return finalizeState({
         ...state,

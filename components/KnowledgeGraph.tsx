@@ -1,9 +1,9 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../lib/store';
-import { adjustKnowledgeGraph, GraphOperation } from '../lib/ai';
-import { Loader2, Send, Wand2, X, BrainCircuit, Target, BookOpen, UploadCloud, Check, RotateCcw, AlertCircle, Maximize } from 'lucide-react';
+import { GraphOperation, inferModelProvider, resolveAIPresetSettings } from '../lib/ai';
+import { Loader2, Send, Wand2, X, BrainCircuit, Target, BookOpen, UploadCloud, Check, RotateCcw, AlertCircle, Maximize, GitBranch, Link2, Brain, MessageSquare, ThumbsUp, ThumbsDown } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import * as d3 from 'd3';
 import { clsx } from 'clsx';
@@ -11,10 +11,21 @@ import Markdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { useGlobalAIChat } from '../lib/ai-chat-context';
+import { FEEDBACK_QUICK_TAGS } from '../lib/feedback';
+import { buildKnowledgeNodePath, collectDescendantNodeIds, formatKnowledgeNodePath, getKnowledgeNodeMastery, getRelatedKnowledgeNodes, GRAPH_NODE_KIND_LABELS } from '../lib/data/quality';
 
 export function KnowledgeGraph() {
   const { state, dispatch } = useAppContext();
   const { startGraphAnalysis } = useGlobalAIChat();
+  const effectiveSettings = useMemo(() => resolveAIPresetSettings(state.settings), [state.settings]);
+  const subjectNodes = useMemo(
+    () => state.knowledgeNodes.filter((node) => node.subject === state.currentSubject),
+    [state.currentSubject, state.knowledgeNodes]
+  );
+  const subjectMemories = useMemo(
+    () => state.memories.filter((memory) => memory.subject === state.currentSubject),
+    [state.currentSubject, state.memories]
+  );
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
@@ -23,20 +34,86 @@ export function KnowledgeGraph() {
   const [command, setCommand] = useState('');
   const [loading, setLoading] = useState(false);
   const [renderTrigger, setRenderTrigger] = useState(0);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editNodeName, setEditNodeName] = useState('');
   const [image, setImage] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'graph' | 'outline'>('graph');
+  const [previewFeedback, setPreviewFeedback] = useState<{ sentiment: 'positive' | 'negative'; tag?: string } | null>(null);
+  const selectedNodeId =
+    state.activeGraphScope?.subject === state.currentSubject ? state.activeGraphScope.nodeId : null;
   
   // Use global draft state for preview instead of local state
   const previewResult = state.draftGraphProposal || null;
   const setPreviewResult = (val: any) => {
     dispatch({ type: 'UPDATE_DRAFT', payload: { draftGraphProposal: val } });
+    setPreviewFeedback(null);
   };
   const [isDragging, setIsDragging] = useState(false);
   const [confirmModal, setConfirmModal] = useState<{ isOpen: boolean; title: string; message: string; onConfirm: () => void } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const scopeDefaultsRef = useRef({
+    includeDescendants: state.activeGraphScope?.includeDescendants ?? true,
+    includeRelated: state.activeGraphScope?.includeRelated ?? false,
+  });
+
+  useEffect(() => {
+    scopeDefaultsRef.current = {
+      includeDescendants: state.activeGraphScope?.includeDescendants ?? true,
+      includeRelated: state.activeGraphScope?.includeRelated ?? false,
+    };
+  }, [state.activeGraphScope?.includeDescendants, state.activeGraphScope?.includeRelated]);
+
+  const selectGraphNode = useCallback((nodeId: string | null, overrides?: { includeDescendants?: boolean; includeRelated?: boolean }) => {
+    const defaults = scopeDefaultsRef.current;
+    dispatch({
+      type: 'SET_ACTIVE_GRAPH_SCOPE',
+      payload: {
+        nodeId,
+        subject: state.currentSubject,
+        includeDescendants: overrides?.includeDescendants ?? defaults.includeDescendants,
+        includeRelated: overrides?.includeRelated ?? defaults.includeRelated,
+      },
+    });
+  }, [dispatch, state.currentSubject]);
+
+  const sendScopeQuestionToChat = () => {
+    if (!selectedNodeId) return;
+    const path = formatKnowledgeNodePath(subjectNodes, selectedNodeId);
+    dispatch({
+      type: 'UPDATE_DRAFT',
+      payload: {
+        draftChatQuery: `请围绕导图节点“${path}”进行讲解：梳理核心知识点、常见题型、易错点，以及对应的解题方法。优先结合当前节点与子树中的记忆来回答。`,
+      },
+    });
+    window.dispatchEvent(new CustomEvent('app:navigate', { detail: { view: 'chat' } }));
+  };
+
+  const recordPreviewFeedback = (sentiment: 'positive' | 'negative', feedbackTag?: string) => {
+    if (!previewResult) return;
+    dispatch({
+      type: 'ADD_FEEDBACK_EVENT',
+      payload: {
+        id: uuidv4(),
+        timestamp: Date.now(),
+        subject: state.currentSubject,
+        targetType: 'graph',
+        targetId: `graph-preview:${selectedNodeId || 'global'}`,
+        signalType: sentiment === 'positive' ? 'graph_helpful' : 'graph_inaccurate',
+        sentiment,
+        note: sentiment === 'positive' ? '导图建议有帮助' : '导图建议需要调整',
+        metadata: {
+          workflow: 'graph-preview',
+          preset: effectiveSettings.aiPreset || 'balanced',
+          provider: inferModelProvider(effectiveSettings.graphModel, state.settings),
+          model: effectiveSettings.graphModel,
+          graphScopeNodeId: selectedNodeId,
+          graphScopePath: selectedNodeId ? formatKnowledgeNodePath(subjectNodes, selectedNodeId) : null,
+          feedbackTag,
+        },
+      },
+    });
+    setPreviewFeedback({ sentiment, tag: feedbackTag });
+  };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -52,10 +129,10 @@ export function KnowledgeGraph() {
   // Reset collapsed state and selection when subject changes
   useEffect(() => {
     collapsedIds.current.clear();
-    setSelectedNodeId(null);
+    selectGraphNode(null, { includeDescendants: true, includeRelated: false });
     setEditingNodeId(null);
     setRenderTrigger(prev => prev + 1);
-  }, [state.currentSubject]);
+  }, [selectGraphNode, state.currentSubject]);
 
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
@@ -208,7 +285,7 @@ export function KnowledgeGraph() {
       .on('click', (event, d: any) => {
         event.stopPropagation();
         if (d.data.isVirtual) return;
-        setSelectedNodeId(d.data.id);
+        selectGraphNode(d.data.id);
       })
       .on('dblclick', (event, d: any) => {
         event.stopPropagation();
@@ -294,7 +371,7 @@ export function KnowledgeGraph() {
     return () => {
       // Cleanup
     };
-  }, [state.knowledgeNodes, state.memories, state.currentSubject, renderTrigger, selectedNodeId]);
+  }, [renderTrigger, selectGraphNode, selectedNodeId, state.currentSubject, state.knowledgeNodes, state.memories]);
 
   const handleAdjust = async () => {
     if (!command.trim() && !image) return;
@@ -425,13 +502,31 @@ export function KnowledgeGraph() {
     }
   };
 
-  const selectedNode = state.knowledgeNodes.find(n => n.id === selectedNodeId);
-  const nodeMemories = selectedNode 
-    ? state.memories.filter(m => m.knowledgeNodeIds.includes(selectedNode.id))
+  const selectedNode = subjectNodes.find((node) => node.id === selectedNodeId);
+  const selectedNodePath = selectedNodeId ? formatKnowledgeNodePath(subjectNodes, selectedNodeId) : '';
+  const scopeNodeIds = selectedNodeId
+    ? collectDescendantNodeIds(subjectNodes, selectedNodeId, state.activeGraphScope?.includeDescendants ?? true)
     : [];
-  const nodeMastery = nodeMemories.length > 0 
-    ? nodeMemories.reduce((acc, m) => acc + m.confidence, 0) / nodeMemories.length 
-    : null;
+  const nodeMemories = selectedNode
+    ? subjectMemories.filter((memory) => (memory.knowledgeNodeIds || []).some((id) => scopeNodeIds.includes(id)))
+    : [];
+  const directNodeMemories = selectedNode
+    ? subjectMemories.filter((memory) => (memory.knowledgeNodeIds || []).includes(selectedNode.id))
+    : [];
+  const masterySummary = selectedNode
+    ? getKnowledgeNodeMastery(subjectMemories, subjectNodes, selectedNode.id, state.activeGraphScope?.includeDescendants ?? true)
+    : { mastery: null, memoryCount: 0, mistakeCount: 0 };
+  const nodeMastery = masterySummary.mastery;
+  const relatedNodes = selectedNode ? getRelatedKnowledgeNodes(subjectNodes, subjectMemories, selectedNode.id, 6) : [];
+  const masteryBuckets = nodeMemories.reduce(
+    (acc, memory) => {
+      if (memory.confidence >= 75) acc.strong += 1;
+      else if (memory.confidence >= 45) acc.mid += 1;
+      else acc.weak += 1;
+      return acc;
+    },
+    { strong: 0, mid: 0, weak: 0 }
+  );
 
   const renderOutline = (parentId: string | null, depth: number = 0) => {
     const children = state.knowledgeNodes.filter(n => n.subject === state.currentSubject && n.parentId === parentId);
@@ -440,7 +535,7 @@ export function KnowledgeGraph() {
         <div className={clsx(
           "flex items-center gap-2 py-1 px-2 rounded hover:bg-slate-800 cursor-pointer",
           selectedNodeId === node.id && "bg-indigo-500/20 text-indigo-400"
-        )} onClick={() => setSelectedNodeId(node.id)}>
+        )} onClick={() => selectGraphNode(node.id)}>
           <span className="text-slate-500">
             {state.knowledgeNodes.some(n => n.parentId === node.id) ? '▾' : '•'}
           </span>
@@ -646,6 +741,48 @@ export function KnowledgeGraph() {
                     </div>
                   ))}
                 </div>
+                <div className="flex flex-wrap items-center gap-2 border-t border-slate-800 pt-2 text-[10px] text-slate-500">
+                  <span>反馈</span>
+                  <button
+                    onClick={() => recordPreviewFeedback('positive')}
+                    className={clsx(
+                      'inline-flex items-center gap-1 rounded-full border px-2 py-1',
+                      previewFeedback?.sentiment === 'positive'
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+                        : 'border-slate-700 bg-slate-950 text-slate-400'
+                    )}
+                  >
+                    <ThumbsUp className="h-3 w-3" />
+                    有用
+                  </button>
+                  <button
+                    onClick={() => recordPreviewFeedback('negative')}
+                    className={clsx(
+                      'inline-flex items-center gap-1 rounded-full border px-2 py-1',
+                      previewFeedback?.sentiment === 'negative'
+                        ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
+                        : 'border-slate-700 bg-slate-950 text-slate-400'
+                    )}
+                  >
+                    <ThumbsDown className="h-3 w-3" />
+                    需调整
+                  </button>
+                  {previewFeedback?.sentiment === 'negative' &&
+                    FEEDBACK_QUICK_TAGS.map((tag) => (
+                      <button
+                        key={`graph-preview-${tag}`}
+                        onClick={() => recordPreviewFeedback('negative', tag)}
+                        className={clsx(
+                          'rounded-full border px-2 py-1',
+                          previewFeedback.tag === tag
+                            ? 'border-rose-500/40 bg-rose-500/10 text-rose-200'
+                            : 'border-slate-700 bg-slate-950 text-slate-400'
+                        )}
+                      >
+                        {tag}
+                      </button>
+                    ))}
+                </div>
               </div>
             ) : (
               <div 
@@ -763,7 +900,7 @@ export function KnowledgeGraph() {
                             message: '确定要删除此节点吗？相关的记忆将失去此节点的关联。',
                             onConfirm: () => {
                               dispatch({ type: 'DELETE_NODE', payload: selectedNode.id });
-                              setSelectedNodeId(null);
+                              selectGraphNode(null);
                               setConfirmModal(null);
                             }
                           });
@@ -774,12 +911,60 @@ export function KnowledgeGraph() {
                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path></svg>
                       </button>
                     )}
-                    <button onClick={() => setSelectedNodeId(null)} className="text-slate-500 hover:text-slate-300">
+                    <button onClick={() => selectGraphNode(null)} className="text-slate-500 hover:text-slate-300">
                       <X className="w-4 h-4" />
                     </button>
                   </div>
                 </>
               )}
+            </div>
+            <div className="px-4 pb-4 space-y-3">
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3">
+                <div className="flex items-center gap-2 text-[11px] font-semibold text-slate-400">
+                  <GitBranch className="h-3.5 w-3.5" />
+                  节点路径
+                </div>
+                <div className="mt-2 text-xs leading-5 text-slate-300">{selectedNodePath || selectedNode.name}</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <span className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-400">
+                    {GRAPH_NODE_KIND_LABELS[selectedNode.kind || 'knowledge']}
+                  </span>
+                  <span className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-400">
+                    范围节点 {scopeNodeIds.length}
+                  </span>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => selectGraphNode(selectedNode.id, { includeDescendants: !(state.activeGraphScope?.includeDescendants ?? true) })}
+                  className={clsx(
+                    'rounded-full border px-2 py-1 text-[10px]',
+                    state.activeGraphScope?.includeDescendants ?? true
+                      ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-200'
+                      : 'border-slate-700 bg-slate-950 text-slate-400'
+                  )}
+                >
+                  子树范围
+                </button>
+                <button
+                  onClick={() => selectGraphNode(selectedNode.id, { includeRelated: !(state.activeGraphScope?.includeRelated ?? false) })}
+                  className={clsx(
+                    'rounded-full border px-2 py-1 text-[10px]',
+                    state.activeGraphScope?.includeRelated
+                      ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-200'
+                      : 'border-slate-700 bg-slate-950 text-slate-400'
+                  )}
+                >
+                  关联扩展
+                </button>
+                <button
+                  onClick={sendScopeQuestionToChat}
+                  className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-200"
+                >
+                  <MessageSquare className="h-3 w-3" />
+                  基于当前节点问 AI
+                </button>
+              </div>
             </div>
             
             <div className="p-4 border-b border-slate-800">
@@ -806,6 +991,34 @@ export function KnowledgeGraph() {
                   />
                 </div>
               )}
+              <div className="grid grid-cols-3 gap-2 mb-4 text-[10px]">
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center text-slate-400">
+                  <div className="text-emerald-300">{masteryBuckets.strong}</div>
+                  <div>熟练</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center text-slate-400">
+                  <div className="text-amber-300">{masteryBuckets.mid}</div>
+                  <div>待巩固</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center text-slate-400">
+                  <div className="text-rose-300">{masteryBuckets.weak}</div>
+                  <div>薄弱</div>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-[10px] text-slate-400">
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center">
+                  <div className="text-slate-200">{nodeMemories.length}</div>
+                  <div>子树记忆</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center">
+                  <div className="text-slate-200">{directNodeMemories.length}</div>
+                  <div>直接挂载</div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-950 p-2 text-center">
+                  <div className="text-slate-200">{masterySummary.mistakeCount}</div>
+                  <div>相关错题</div>
+                </div>
+              </div>
               {selectedNode.testingMethods && selectedNode.testingMethods.length > 0 && (
                 <div className="mt-3">
                   <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">常见考法</h4>
@@ -821,6 +1034,33 @@ export function KnowledgeGraph() {
             </div>
 
             <div className="flex-1 overflow-y-auto p-4">
+              <div className="mb-4">
+                <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
+                  <Link2 className="w-3 h-3" />
+                  相关节点
+                </h4>
+                <div className="space-y-2">
+                  {relatedNodes.length === 0 ? (
+                    <p className="text-xs text-slate-500">暂无相关节点</p>
+                  ) : (
+                    relatedNodes.map((item) => (
+                      <button
+                        key={item.node.id}
+                        onClick={() => selectGraphNode(item.node.id)}
+                        className="w-full rounded-lg border border-slate-800 bg-slate-950 p-3 text-left hover:border-slate-700 transition-colors"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-xs text-slate-200">{item.node.name}</div>
+                            <div className="mt-1 truncate text-[10px] text-slate-500">{item.reasons.slice(0, 2).join(' · ')}</div>
+                          </div>
+                          <span className="text-[10px] text-indigo-300">{Math.round(item.score * 100)}%</span>
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
               <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
                 <BookOpen className="w-3 h-3" />
                 关联记忆 ({nodeMemories.length})

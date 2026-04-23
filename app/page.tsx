@@ -24,6 +24,19 @@ function MainLayout({ currentView, setCurrentView }: { currentView: View, setCur
   const [mountedViews, setMountedViews] = useState<View[]>(['dashboard']);
 
   useEffect(() => {
+    const handleNavigate = (event: Event) => {
+      const detail = (event as CustomEvent<{ view?: View }>).detail;
+      if (detail?.view) {
+        setCurrentView(detail.view);
+        setIsMobileMenuOpen(false);
+      }
+    };
+
+    window.addEventListener('app:navigate', handleNavigate as EventListener);
+    return () => window.removeEventListener('app:navigate', handleNavigate as EventListener);
+  }, [setCurrentView]);
+
+  useEffect(() => {
     const fontSizeMap: Record<string, string> = {
       small: '12px',
       base: '14px',

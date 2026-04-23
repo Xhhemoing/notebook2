@@ -28,7 +28,9 @@ export const memoryCreateSchema = z.object({
   dataSource: memoryDataSourceSchema.optional(),
   notes: z.string().optional(),
   correctAnswer: z.string().optional(),
+  questionNo: z.string().optional(),
   questionType: z.string().optional(),
+  studentAnswer: z.string().optional(),
   source: z.string().optional(),
   sourceTextbookId: z.string().optional(),
   sourceTextbookPage: z.number().int().positive().optional(),
@@ -42,12 +44,43 @@ export const memoryCreateSchema = z.object({
   visualDescription: z.string().optional(),
   visualDescriptions: z.array(z.string()).optional(),
   analysisProcess: z.string().optional(),
+  needsConfirmation: z.boolean().optional(),
+  conflict: z.boolean().optional(),
+  errorReasonCategory: z.string().optional(),
+  evidence: z
+    .object({
+      sourceText: z.string().optional(),
+      locationHint: z.string().optional(),
+      keySentence: z.string().optional(),
+    })
+    .optional(),
+  optionAnalysis: z.record(z.string(), z.string()).optional(),
+  learningTask: z.string().optional(),
+  transferExercises: z.array(z.string()).optional(),
+  memoryCard: z
+    .object({
+      front: z.string().optional(),
+      back: z.string().optional(),
+    })
+    .optional(),
+  reviewPriority: z.enum(['high', 'medium', 'low', 'summary_only']).optional(),
   fsrs: z.any().optional(),
   embedding: z.array(z.number()).optional(),
   type: z.enum(['concept', 'qa', 'vocabulary']).optional(),
   collectionId: z.string().optional(),
   collectionName: z.string().optional(),
-  vocabularyData: z.any().optional(),
+  vocabularyData: z
+    .object({
+      context: z.string().optional(),
+      meaning: z.string().optional(),
+      usage: z.string().optional(),
+      mnemonics: z.string().optional(),
+      synonyms: z.array(z.string()).optional(),
+      originalSentence: z.string().optional(),
+      confusions: z.array(z.string()).optional(),
+    })
+    .passthrough()
+    .optional(),
   lastReviewed: z.number().optional(),
   deletedAt: z.number().optional(),
 }).passthrough();

@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Activity, Archive, Download, Sparkles, Trash2 } from 'lucide-react';
 
 import { useAppContext } from '@/lib/store';
@@ -31,6 +31,7 @@ function formatIssueLabel(issue: string) {
 
 export default function LogSettings() {
   const { state, dispatch } = useAppContext();
+  const [snapshotNow] = useState(() => Date.now());
 
   const autoResources = useMemo(
     () => state.resources.filter((resource) => !resource.isFolder && resource.retentionPolicy === 'auto'),
@@ -38,11 +39,11 @@ export default function LogSettings() {
   );
 
   const expiringSoonCount = useMemo(() => {
-    const threshold = Date.now() + 3 * 24 * 60 * 60 * 1000;
+    const threshold = snapshotNow + 3 * 24 * 60 * 60 * 1000;
     return autoResources.filter(
       (resource) => Number.isFinite(resource.expiresAt) && (resource.expiresAt as number) <= threshold
     ).length;
-  }, [autoResources]);
+  }, [autoResources, snapshotNow]);
 
   const recentFeedback = useMemo(() => state.feedbackEvents.slice(0, 20), [state.feedbackEvents]);
 

@@ -25,7 +25,7 @@ export async function rerankWithProvider(
   config: RetrievalProviderConfig,
   query: string,
   documents: { id: string; text: string }[]
-) {
+): Promise<Array<{ id: string; score: number; reason?: string }>> {
   const data = await postJson(config.url || '', config.apiKey, {
     model: config.model,
     query,
