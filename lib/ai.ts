@@ -89,6 +89,26 @@ export function inferModelProvider(modelId: string, settings?: Settings) {
   return 'builtin';
 }
 
+function resolveConfiguredModelProviderType(
+  modelId: string,
+  settings?: Settings
+): 'openai' | 'gemini' | null {
+  if (!modelId || !settings) return null;
+
+  if (modelId.includes(':')) {
+    const providerId = modelId.split(':')[0];
+    const provider = settings.customProviders?.find((item) => item.id === providerId);
+    return provider?.type || null;
+  }
+
+  const customModel = settings.customModels?.find((item) => item.id === modelId);
+  return customModel?.provider || null;
+}
+
+export function shouldUsePageImageOcrForTextbookPdf(modelId: string, settings?: Settings) {
+  return resolveConfiguredModelProviderType(modelId, settings) === 'openai';
+}
+
 function getGlobalAI() {
   if (!globalAiInstance) {
     const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
@@ -186,6 +206,18 @@ export async function processTextbookPDF(
   settings: Settings,
   logCallback?: (log: any) => void
 ): Promise<{ pageNumber: number; content: string }[]> {
+  if (shouldUsePageImageOcrForTextbookPdf(settings.parseModel, settings)) {
+    if (logCallback) {
+      logCallback({
+        type: 'parse',
+        model: settings.parseModel,
+        prompt: '[Textbook PDF OCR Strategy]',
+        response: '当前模型走按页图片 OCR，由调用方执行 PDF 转图片后逐页识别。',
+      });
+    }
+    return [];
+  }
+
   const { ai: client, modelName, isCustomOpenAI, customModel } = getAIClient(settings.parseModel, settings);
   
   const prompt = `你是一个专业的课本数字化助手。请对这个PDF文档进行OCR识别，提取出每一页的完整文字内容。
@@ -197,8 +229,7 @@ export async function processTextbookPDF(
   let resultStr = '';
   try {
     if (isCustomOpenAI && customModel) {
-      // Fallback for custom models that might not support PDF
-      throw new Error('当前自定义模型可能不支持直接处理PDF，请尝试关闭OCR或使用默认Gemini模型。');
+      return [];
     } else if (client) {
       const response = await client.models.generateContent({
         model: modelName,

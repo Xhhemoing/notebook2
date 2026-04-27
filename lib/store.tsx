@@ -1,14 +1,16 @@
 'use client';
 
-import React, { createContext, useContext, useReducer, useEffect, useState, useRef } from 'react';
-import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict, ReviewEvent, FSRSProfile, RetrievalIndexState, GraphScope } from './types';
+import React, { createContext, useContext, useReducer, useEffect, useMemo, useState, useRef } from 'react';
+import { AppState, Action, Subject, KnowledgeNode, Memory, Link, Resource, Textbook, SyncMemoryConflict, ReviewEvent, FSRSProfile, RetrievalIndexState, GraphScope, SubjectGraphViewState } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { deleteDB, openDB } from 'idb';
 import { evaluateMemoryQuality, MEMORY_QUALITY_RULE_VERSION, normalizeKnowledgeNodes } from './data/quality';
 import { applyDataRetention, normalizeResourceRetention } from './feedback';
+import { getGraphViewStateForSubject, normalizeSubjectGraphViewState } from './graph-view';
 import { normalizeInputHistoryItems, normalizeInputHistoryItem } from './input-history';
 import { enrichAILog } from './prompting';
 import { syncRetrievalIndex } from './retrieval/client';
+import { buildSubjectGraphMigrationPlan, SUBJECT_GRAPH_SEED_VERSION } from './subject-graph-import';
 import { normalizeTextbookForState } from './textbook';
 
 const DB_NAME = 'gaokao-ai-db';
@@ -72,6 +74,23 @@ async function loadState(): Promise<AppState | null> {
   } catch (e) {
     console.error('Failed to load state from IDB', e);
     return null;
+  }
+}
+
+async function loadStateWithTimeout(timeoutMs: number): Promise<AppState | null> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    return await Promise.race<AppState | null>([
+      loadState(),
+      new Promise<AppState | null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
   }
 }
 
@@ -382,6 +401,27 @@ function normalizeGraphScope(state: Pick<AppState, 'currentSubject' | 'knowledge
   };
 }
 
+function normalizeGraphViewBySubject(
+  graphViewBySubject: Record<Subject, SubjectGraphViewState> | undefined,
+  knowledgeNodes: KnowledgeNode[]
+): Record<Subject, SubjectGraphViewState> {
+  const nodesBySubject = new Map<Subject, KnowledgeNode[]>();
+  for (const node of knowledgeNodes || []) {
+    const existing = nodesBySubject.get(node.subject);
+    if (existing) {
+      existing.push(node);
+    } else {
+      nodesBySubject.set(node.subject, [node]);
+    }
+  }
+
+  const normalized: Record<Subject, SubjectGraphViewState> = {};
+  for (const [subject, state] of Object.entries(graphViewBySubject || {})) {
+    normalized[subject] = normalizeSubjectGraphViewState(nodesBySubject.get(subject) || [], state);
+  }
+  return normalized;
+}
+
 function normalizeMemoryForState(
   memory: Memory,
   validNodeIds: Set<string>,
@@ -607,6 +647,7 @@ function withDerivedLinks(state: AppState): AppState {
     textbooks: normalizedTextbooks,
     resources: normalizedResources,
     knowledgeNodes: normalizedNodes,
+    graphViewBySubject: normalizeGraphViewBySubject(state.graphViewBySubject, normalizedNodes),
     activeGraphScope: normalizeGraphScope(
       { currentSubject: state.currentSubject, knowledgeNodes: normalizedNodes },
       state.activeGraphScope
@@ -627,6 +668,8 @@ function finalizeState(state: AppState): AppState {
 
 const baseInitialState: AppState = {
   currentSubject: '数学',
+  subjectGraphSeedVersion: undefined,
+  graphViewBySubject: {},
   memories: initialMemories,
   knowledgeNodes: initialNodes,
   links: buildDerivedLinks(initialMemories, initialNodes, [], [], []),
@@ -685,21 +728,73 @@ const initialState: AppState = finalizeState(baseInitialState);
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case 'SET_SUBJECT':
+      const subjectNodes = state.knowledgeNodes.filter((node) => node.subject === action.payload);
+      const subjectGraphView = getGraphViewStateForSubject(state.graphViewBySubject, action.payload, subjectNodes);
       return finalizeState({
         ...state,
         currentSubject: action.payload,
+        graphViewBySubject: {
+          ...(state.graphViewBySubject || {}),
+          [action.payload]: subjectGraphView,
+        },
         activeGraphScope: normalizeGraphScope(
           { currentSubject: action.payload, knowledgeNodes: state.knowledgeNodes },
-          { nodeId: null, subject: action.payload, includeDescendants: true, includeRelated: false }
+          {
+            nodeId: subjectGraphView.focusNodeId,
+            subject: action.payload,
+            includeDescendants: subjectGraphView.includeDescendants,
+            includeRelated: subjectGraphView.includeRelated,
+          }
         ),
       });
-    case 'SET_ACTIVE_GRAPH_SCOPE':
+    case 'SET_SUBJECT_GRAPH_SEED_VERSION':
       return finalizeState({
         ...state,
-        activeGraphScope: normalizeGraphScope(
-          { currentSubject: state.currentSubject, knowledgeNodes: state.knowledgeNodes },
-          action.payload
-        ),
+        subjectGraphSeedVersion: action.payload,
+      });
+    case 'UPDATE_SUBJECT_GRAPH_VIEW':
+      const nextSubjectNodes = state.knowledgeNodes.filter((node) => node.subject === action.payload.subject);
+      const previousGraphView = getGraphViewStateForSubject(
+        state.graphViewBySubject,
+        action.payload.subject,
+        nextSubjectNodes
+      );
+      return finalizeState({
+        ...state,
+        graphViewBySubject: {
+          ...(state.graphViewBySubject || {}),
+          [action.payload.subject]: normalizeSubjectGraphViewState(nextSubjectNodes, {
+            ...previousGraphView,
+            ...action.payload.patch,
+            updatedAt: Date.now(),
+          }),
+        },
+      });
+    case 'SET_ACTIVE_GRAPH_SCOPE':
+      const nextGraphScope = normalizeGraphScope(
+        { currentSubject: state.currentSubject, knowledgeNodes: state.knowledgeNodes },
+        action.payload
+      );
+      return finalizeState({
+        ...state,
+        activeGraphScope: nextGraphScope,
+        graphViewBySubject: {
+          ...(state.graphViewBySubject || {}),
+          [state.currentSubject]: normalizeSubjectGraphViewState(
+            state.knowledgeNodes.filter((node) => node.subject === state.currentSubject),
+            {
+              ...getGraphViewStateForSubject(
+                state.graphViewBySubject,
+                state.currentSubject,
+                state.knowledgeNodes.filter((node) => node.subject === state.currentSubject)
+              ),
+              focusNodeId: nextGraphScope.nodeId,
+              includeDescendants: nextGraphScope.includeDescendants,
+              includeRelated: nextGraphScope.includeRelated,
+              updatedAt: Date.now(),
+            }
+          ),
+        },
       });
     case 'ADD_MEMORY':
       return finalizeState({
@@ -1012,6 +1107,29 @@ function reducer(state: AppState, action: Action): AppState {
           ...(Array.isArray(state.inputHistory) ? state.inputHistory : []),
         ].slice(0, 50),
       });
+    case 'UPDATE_INPUT_HISTORY':
+      return finalizeState({
+        ...state,
+        inputHistory: (Array.isArray(state.inputHistory) ? state.inputHistory : []).map((item) => {
+          const normalized = normalizeInputHistoryItem(item, state.currentSubject) || item;
+          if (normalized.id !== action.payload.id) return normalized;
+
+          return (
+            normalizeInputHistoryItem(
+              {
+                ...normalized,
+                ...action.payload.patch,
+                id: normalized.id,
+              },
+              state.currentSubject
+            ) || {
+              ...normalized,
+              ...action.payload.patch,
+              id: normalized.id,
+            }
+          );
+        }),
+      });
     case 'DELETE_INPUT_HISTORY':
       return finalizeState({
         ...state,
@@ -1185,31 +1303,37 @@ const AppContext = createContext<{
   dispatch: React.Dispatch<Action>;
 } | null>(null);
 
-function buildRetrievalSourceSignature(state: AppState) {
-  const memorySignature = state.memories
+function buildRetrievalSourceSignatureFromSources(
+  memories: AppState['memories'],
+  textbooks: AppState['textbooks'],
+  resources: AppState['resources'],
+  syncKey: string | undefined
+) {
+  const memorySignature = memories
     .map((memory) => `${memory.id}:${memory.updatedAt || memory.createdAt}:${memory.status || 'active'}`)
     .sort()
     .join('|');
-  const textbookSignature = state.textbooks
+  const textbookSignature = textbooks
     .map((textbook) => `${textbook.id}:${textbook.updatedAt || textbook.createdAt}:${textbook.pages.length}`)
     .sort()
     .join('|');
-  const resourceSignature = state.resources
+  const resourceSignature = resources
     .map((resource) => `${resource.id}:${resource.updatedAt || resource.createdAt}:${resource.status || 'active'}`)
     .sort()
     .join('|');
 
-  return `${state.settings.syncKey || ''}::${memorySignature}::${textbookSignature}::${resourceSignature}`;
+  return `${syncKey || ''}::${memorySignature}::${textbookSignature}::${resourceSignature}`;
 }
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [isMounted, setIsMounted] = useState(false);
+  const subjectGraphSeedMigrationTriggeredRef = useRef(false);
 
   useEffect(() => {
     async function load() {
       try {
-        const idbState = await loadState();
+        const idbState = await loadStateWithTimeout(2500);
         if (idbState) {
           dispatch({ type: 'LOAD_STATE', payload: idbState });
         } else {
@@ -1245,12 +1369,68 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const stateRef = useRef(state);
   const retrievalSourceSignatureRef = useRef('');
   useEffect(() => {
+    if (!isMounted) return;
+    if (state.subjectGraphSeedVersion === SUBJECT_GRAPH_SEED_VERSION) return;
+    if (subjectGraphSeedMigrationTriggeredRef.current) return;
+
+    subjectGraphSeedMigrationTriggeredRef.current = true;
+    const migrationPlan = buildSubjectGraphMigrationPlan(state.knowledgeNodes);
+
+    if (migrationPlan.nodesToAdd.length > 0) {
+      dispatch({ type: 'BATCH_ADD_NODES', payload: migrationPlan.nodesToAdd });
+    }
+
+    dispatch({
+      type: 'ADD_LOG',
+      payload: {
+        type: 'ingestion',
+        model: 'subject-graph-seed',
+        prompt: `subject-graph-seed migration ${migrationPlan.version}`,
+        response: `学科导图初始化迁移完成：新增 ${migrationPlan.addedCount} 个节点，覆盖 ${migrationPlan.plans.length} 个学科。`,
+        subject: state.currentSubject,
+        metadata: {
+          mode: 'initial_migration',
+          version: migrationPlan.version,
+          addedCount: migrationPlan.addedCount,
+          subjects: migrationPlan.plans.map((plan) => ({
+            subject: plan.subject,
+            addedCount: plan.addedCount,
+            totalSeedNodeCount: plan.totalSeedNodeCount,
+            sourceFileName: plan.sourceFileName,
+          })),
+          missingSubjects: migrationPlan.missingSubjects,
+          invalidSources: migrationPlan.invalidSources,
+        },
+      },
+    });
+    dispatch({ type: 'SET_SUBJECT_GRAPH_SEED_VERSION', payload: migrationPlan.version });
+  }, [isMounted, state.currentSubject, state.knowledgeNodes, state.subjectGraphSeedVersion]);
+
+  useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
+  const retrievalSourceSignature = useMemo(
+    () =>
+      buildRetrievalSourceSignatureFromSources(
+        state.memories,
+        state.textbooks,
+        state.resources,
+        state.settings.syncKey
+      ),
+    [state.memories, state.textbooks, state.resources, state.settings.syncKey]
+  );
+  const retrievalPendingDocumentCount = useMemo(
+    () =>
+      state.memories.length +
+      state.textbooks.reduce((sum, textbook) => sum + textbook.pages.length, 0) +
+      state.resources.length,
+    [state.memories, state.textbooks, state.resources]
+  );
+
   useEffect(() => {
     if (!isMounted) return;
-    const signature = buildRetrievalSourceSignature(state);
+    const signature = retrievalSourceSignature;
     if (!retrievalSourceSignatureRef.current) {
       retrievalSourceSignatureRef.current = signature;
       return;
@@ -1262,12 +1442,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         payload: {
           status: 'dirty',
           dirty: true,
-          pendingDocumentCount: state.memories.length + state.textbooks.reduce((sum, textbook) => sum + textbook.pages.length, 0) + state.resources.length,
+          pendingDocumentCount: retrievalPendingDocumentCount,
           lastError: undefined,
         },
       });
     }
-  }, [isMounted, state.memories, state.textbooks, state.resources, state.settings.syncKey]);
+  }, [isMounted, retrievalPendingDocumentCount, retrievalSourceSignature]);
 
   useEffect(() => {
     if (!isMounted) return;

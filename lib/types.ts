@@ -37,6 +37,24 @@ export interface GraphScope {
   updatedAt: number;
 }
 
+export type GraphViewMode = 'graph' | 'outline';
+
+export interface GraphViewportTransform {
+  x: number;
+  y: number;
+  k: number;
+}
+
+export interface SubjectGraphViewState {
+  viewMode: GraphViewMode;
+  focusNodeId: string | null;
+  includeDescendants: boolean;
+  includeRelated: boolean;
+  collapsedNodeIds: string[];
+  viewport?: GraphViewportTransform | null;
+  updatedAt: number;
+}
+
 export interface FSRSData {
   due: number; // timestamp
   stability: number;
@@ -539,6 +557,8 @@ export interface Link {
 
 export interface AppState {
   currentSubject: Subject;
+  subjectGraphSeedVersion?: string;
+  graphViewBySubject?: Record<Subject, SubjectGraphViewState>;
   memories: Memory[];
   knowledgeNodes: KnowledgeNode[];
   links: Link[];
@@ -564,6 +584,8 @@ export interface AppState {
 
 export type Action =
   | { type: 'SET_SUBJECT'; payload: Subject }
+  | { type: 'SET_SUBJECT_GRAPH_SEED_VERSION'; payload: string }
+  | { type: 'UPDATE_SUBJECT_GRAPH_VIEW'; payload: { subject: Subject; patch: Partial<SubjectGraphViewState> } }
   | { type: 'SET_ACTIVE_GRAPH_SCOPE'; payload: Partial<GraphScope> | null }
   | { type: 'ADD_MEMORY'; payload: Memory }
   | { type: 'UPDATE_MEMORY'; payload: Memory }
@@ -601,6 +623,7 @@ export type Action =
   | { type: 'SAVE_NODES_STATE' }
   | { type: 'UNDO_NODES' }
   | { type: 'ADD_INPUT_HISTORY'; payload: InputHistoryItem }
+  | { type: 'UPDATE_INPUT_HISTORY'; payload: { id: string; patch: Partial<InputHistoryItem> } }
   | { type: 'DELETE_INPUT_HISTORY'; payload: string }
   | { type: 'DELETE_MEMORIES_BY_FUNCTION'; payload: { subject: Subject; functionType: string } }
   | { type: 'BATCH_DELETE_MEMORIES'; payload: string[] }

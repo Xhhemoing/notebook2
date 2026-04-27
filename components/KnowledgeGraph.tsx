@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../lib/store';
 import { GraphOperation, inferModelProvider, resolveAIPresetSettings } from '../lib/ai';
+import { buildGraphRenderPlan, DEFAULT_GRAPH_MAX_VISIBLE_NODES, getGraphViewStateForSubject } from '../lib/graph-view';
 import { Loader2, Send, Wand2, X, BrainCircuit, Target, BookOpen, UploadCloud, Check, RotateCcw, AlertCircle, Maximize, GitBranch, Link2, Brain, MessageSquare, ThumbsUp, ThumbsDown } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import * as d3 from 'd3';
@@ -13,6 +14,7 @@ import rehypeKatex from 'rehype-katex';
 import { useGlobalAIChat } from '../lib/ai-chat-context';
 import { FEEDBACK_QUICK_TAGS } from '../lib/feedback';
 import { buildKnowledgeNodePath, collectDescendantNodeIds, formatKnowledgeNodePath, getKnowledgeNodeMastery, getRelatedKnowledgeNodes, GRAPH_NODE_KIND_LABELS } from '../lib/data/quality';
+import type { GraphViewMode, GraphViewportTransform, SubjectGraphViewState } from '../lib/types';
 
 export function KnowledgeGraph() {
   const { state, dispatch } = useAppContext();
@@ -30,6 +32,13 @@ export function KnowledgeGraph() {
   const containerRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
   const collapsedIds = useRef<Set<string>>(new Set());
+  const latestViewportRef = useRef<GraphViewportTransform | null>(null);
+  const persistedViewportRef = useRef<GraphViewportTransform | null>(null);
+  const restoreViewportRef = useRef(true);
+  const fitToAnchorRef = useRef(false);
+  const viewportPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hydratedSubjectRef = useRef<string | null>(null);
+  const lastFocusedNodeRef = useRef<string | null>(null);
   
   const [command, setCommand] = useState('');
   const [loading, setLoading] = useState(false);
@@ -37,8 +46,12 @@ export function KnowledgeGraph() {
   const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
   const [editNodeName, setEditNodeName] = useState('');
   const [image, setImage] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'graph' | 'outline'>('graph');
   const [previewFeedback, setPreviewFeedback] = useState<{ sentiment: 'positive' | 'negative'; tag?: string } | null>(null);
+  const subjectGraphView = useMemo(
+    () => getGraphViewStateForSubject(state.graphViewBySubject, state.currentSubject, subjectNodes),
+    [state.currentSubject, state.graphViewBySubject, subjectNodes]
+  );
+  const [viewMode, setViewMode] = useState<GraphViewMode>(subjectGraphView.viewMode);
   const selectedNodeId =
     state.activeGraphScope?.subject === state.currentSubject ? state.activeGraphScope.nodeId : null;
   
@@ -62,6 +75,38 @@ export function KnowledgeGraph() {
       includeRelated: state.activeGraphScope?.includeRelated ?? false,
     };
   }, [state.activeGraphScope?.includeDescendants, state.activeGraphScope?.includeRelated]);
+
+  const persistSubjectGraphView = useCallback((patch: Partial<SubjectGraphViewState>) => {
+    dispatch({
+      type: 'UPDATE_SUBJECT_GRAPH_VIEW',
+      payload: {
+        subject: state.currentSubject,
+        patch,
+      },
+    });
+  }, [dispatch, state.currentSubject]);
+
+  const persistViewport = useCallback((transform: d3.ZoomTransform | GraphViewportTransform | null) => {
+    if (!transform) return;
+    const viewport = 'apply' in transform
+      ? { x: transform.x, y: transform.y, k: transform.k }
+      : transform;
+    latestViewportRef.current = viewport;
+    if (viewportPersistTimerRef.current) {
+      clearTimeout(viewportPersistTimerRef.current);
+    }
+    viewportPersistTimerRef.current = setTimeout(() => {
+      persistSubjectGraphView({ viewport });
+    }, 180);
+  }, [persistSubjectGraphView]);
+
+  useEffect(() => {
+    return () => {
+      if (viewportPersistTimerRef.current) {
+        clearTimeout(viewportPersistTimerRef.current);
+      }
+    };
+  }, []);
 
   const selectGraphNode = useCallback((nodeId: string | null, overrides?: { includeDescendants?: boolean; includeRelated?: boolean }) => {
     const defaults = scopeDefaultsRef.current;
@@ -126,19 +171,141 @@ export function KnowledgeGraph() {
     }
   };
 
-  // Reset collapsed state and selection when subject changes
+  const nodeMasteryMap = useMemo(() => {
+    const bucket = new Map<string, { sum: number; count: number }>();
+    for (const memory of subjectMemories) {
+      for (const nodeId of memory.knowledgeNodeIds || []) {
+        const existing = bucket.get(nodeId) || { sum: 0, count: 0 };
+        existing.sum += memory.confidence;
+        existing.count += 1;
+        bucket.set(nodeId, existing);
+      }
+    }
+
+    const masteryMap = new Map<string, number | null>();
+    for (const node of subjectNodes) {
+      const value = bucket.get(node.id);
+      masteryMap.set(node.id, value ? value.sum / value.count : null);
+    }
+    return masteryMap;
+  }, [subjectMemories, subjectNodes]);
+
+  const subjectChildrenByParent = useMemo(() => {
+    const childrenByParent = new Map<string | null, typeof subjectNodes>();
+    for (const node of subjectNodes) {
+      const key = node.parentId;
+      const existing = childrenByParent.get(key);
+      if (existing) {
+        existing.push(node);
+      } else {
+        childrenByParent.set(key, [node]);
+      }
+    }
+    for (const group of childrenByParent.values()) {
+      group.sort((left, right) => left.order - right.order);
+    }
+    return childrenByParent;
+  }, [subjectNodes]);
+
+  const graphRenderPlan = useMemo(
+    () => {
+      void renderTrigger;
+      return buildGraphRenderPlan(subjectNodes, {
+        focusNodeId: selectedNodeId || subjectGraphView.focusNodeId,
+        collapsedNodeIds: Array.from(collapsedIds.current),
+        maxVisibleNodes: DEFAULT_GRAPH_MAX_VISIBLE_NODES,
+      });
+    },
+    [renderTrigger, selectedNodeId, subjectGraphView.focusNodeId, subjectNodes]
+  );
+  const effectiveCollapsedSet = useMemo(
+    () => new Set(graphRenderPlan.effectiveCollapsedIds),
+    [graphRenderPlan.effectiveCollapsedIds]
+  );
+  const visibleNodesById = useMemo(
+    () => new Map(graphRenderPlan.visibleNodes.map((node) => [node.id, node])),
+    [graphRenderPlan.visibleNodes]
+  );
+  const visibleChildrenByParent = useMemo(() => {
+    const childrenByParent = new Map<string | null, typeof graphRenderPlan.visibleNodes>();
+    for (const node of graphRenderPlan.visibleNodes) {
+      const parentId = node.parentId && visibleNodesById.has(node.parentId) ? node.parentId : null;
+      const current = childrenByParent.get(parentId);
+      if (current) {
+        current.push(node);
+      } else {
+        childrenByParent.set(parentId, [node]);
+      }
+    }
+    for (const children of childrenByParent.values()) {
+      children.sort((left, right) => left.order - right.order);
+    }
+    return childrenByParent;
+  }, [graphRenderPlan, visibleNodesById]);
+  const graphAnchorNodeId = graphRenderPlan.anchorNodeId;
+  const focusPathIds = useMemo(
+    () => new Set(buildKnowledgeNodePath(subjectNodes, graphAnchorNodeId).map((node) => node.id)),
+    [graphAnchorNodeId, subjectNodes]
+  );
+
+  // Restore per-subject graph view when subject changes
   useEffect(() => {
-    collapsedIds.current.clear();
-    selectGraphNode(null, { includeDescendants: true, includeRelated: false });
+    if (hydratedSubjectRef.current === state.currentSubject) return;
+    hydratedSubjectRef.current = state.currentSubject;
+    collapsedIds.current = new Set(subjectGraphView.collapsedNodeIds);
+    latestViewportRef.current = subjectGraphView.viewport || null;
+    persistedViewportRef.current = subjectGraphView.viewport || null;
+    restoreViewportRef.current = true;
+    fitToAnchorRef.current = false;
+    lastFocusedNodeRef.current = subjectGraphView.focusNodeId;
+    setViewMode(subjectGraphView.viewMode);
+    selectGraphNode(subjectGraphView.focusNodeId, {
+      includeDescendants: subjectGraphView.includeDescendants,
+      includeRelated: subjectGraphView.includeRelated,
+    });
     setEditingNodeId(null);
     setRenderTrigger(prev => prev + 1);
-  }, [selectGraphNode, state.currentSubject]);
+  }, [
+    selectGraphNode,
+    state.currentSubject,
+    subjectGraphView.collapsedNodeIds,
+    subjectGraphView.focusNodeId,
+    subjectGraphView.includeDescendants,
+    subjectGraphView.includeRelated,
+    subjectGraphView.viewMode,
+    subjectGraphView.viewport,
+  ]);
 
   useEffect(() => {
-    if (!svgRef.current || !containerRef.current) return;
+    if (lastFocusedNodeRef.current === null) {
+      lastFocusedNodeRef.current = selectedNodeId;
+      return;
+    }
+    if (lastFocusedNodeRef.current === selectedNodeId) return;
+    lastFocusedNodeRef.current = selectedNodeId;
+    fitToAnchorRef.current = true;
+  }, [selectedNodeId]);
 
-    const subjectNodes = state.knowledgeNodes.filter(n => n.subject === state.currentSubject);
-    if (subjectNodes.length === 0) return;
+  useEffect(() => {
+    persistedViewportRef.current = subjectGraphView.viewport || null;
+  }, [subjectGraphView.viewport]);
+
+  const toggleCollapsedNode = useCallback((nodeId: string) => {
+    const nextCollapsed = new Set(collapsedIds.current);
+    if (nextCollapsed.has(nodeId)) nextCollapsed.delete(nodeId);
+    else nextCollapsed.add(nodeId);
+    collapsedIds.current = nextCollapsed;
+    persistSubjectGraphView({
+      collapsedNodeIds: Array.from(nextCollapsed),
+      viewport: latestViewportRef.current,
+    });
+    setRenderTrigger((prev) => prev + 1);
+  }, [persistSubjectGraphView]);
+
+  useEffect(() => {
+    if (viewMode !== 'graph') return;
+    if (!svgRef.current || !containerRef.current) return;
+    if (graphRenderPlan.visibleNodes.length === 0) return;
 
     const width = containerRef.current.clientWidth;
     const height = containerRef.current.clientHeight;
@@ -147,29 +314,37 @@ export function KnowledgeGraph() {
       .attr('width', width)
       .attr('height', height);
 
+    const currentTransform = latestViewportRef.current;
+
     let g = svg.select<SVGGElement>('g.main-group');
     if (g.empty()) {
       g = svg.append('g').attr('class', 'main-group');
+      g.append('g').attr('class', 'links');
+      g.append('g').attr('class', 'nodes');
+      g.append('g').attr('class', 'errors');
       const zoom = d3.zoom<SVGSVGElement, unknown>()
         .scaleExtent([0.1, 4])
         .on('zoom', (e) => {
           g.attr('transform', e.transform);
+          persistViewport(e.transform);
         });
       svg.call(zoom);
       zoomRef.current = zoom;
     }
-
-    g.selectAll('*').remove();
+    const linksLayer = g.select<SVGGElement>('g.links');
+    const nodesLayer = g.select<SVGGElement>('g.nodes');
+    const errorsLayer = g.select<SVGGElement>('g.errors');
+    errorsLayer.selectAll('*').remove();
 
     // Prepare hierarchy for tree layout
     let root: d3.HierarchyNode<any>;
     try {
-      const nodeIds = new Set(subjectNodes.map(n => n.id));
+      const nodeIds = new Set(graphRenderPlan.visibleNodes.map(n => n.id));
       
-      if (subjectNodes.length === 0) return;
+      if (graphRenderPlan.visibleNodes.length === 0) return;
 
       // Map missing parents to null (root) to prevent stratification errors
-      const safeNodes = subjectNodes.map(n => ({
+      const safeNodes = graphRenderPlan.visibleNodes.map(n => ({
         ...n,
         parentId: (n.parentId && nodeIds.has(n.parentId)) ? n.parentId : null
       }));
@@ -201,24 +376,10 @@ export function KnowledgeGraph() {
       }
       
       // Pre-process children for collapsible state
-      root.each((d: any) => {
-        if (d.children) {
-          d._children = d.children;
-        }
-      });
-      
-      root.each((d: any) => {
-        if (d.data && d.data.id && collapsedIds.current.has(d.data.id)) {
-          d.children = null;
-        } else {
-          d.children = d._children;
-        }
-      });
-      
     } catch (err) {
       console.error("Stratification failed:", err);
       // If stratification fails, we might have a cycle or other data issue
-      g.append('text')
+      errorsLayer.append('text')
         .attr('x', width / 2)
         .attr('y', height / 2)
         .attr('text-anchor', 'middle')
@@ -236,142 +397,264 @@ export function KnowledgeGraph() {
     const nodesData = root.descendants();
     const linksData = root.links();
 
-    // Center the tree initially
-    const initialTransform = d3.zoomIdentity.translate(width / 4, height / 2);
-    svg.call(zoomRef.current!.transform, initialTransform);
-    g.attr('transform', initialTransform.toString());
-
-    // Helper for mastery color
-    const getNodeMastery = (nodeId: string) => {
-      const mems = state.memories.filter(m => m.knowledgeNodeIds.includes(nodeId));
-      if (mems.length === 0) return null;
-      const sum = mems.reduce((acc, m) => acc + m.confidence, 0);
-      return sum / mems.length;
-    };
-
     const getNodeColor = (mastery: number | null) => {
-      if (mastery === null) return '#475569'; // slate-600
-      if (mastery < 40) return '#ef4444'; // red-500
-      if (mastery < 70) return '#f59e0b'; // amber-500
-      return '#22c55e'; // green-500
+      if (mastery === null) return '#475569';
+      if (mastery < 40) return '#ef4444';
+      if (mastery < 70) return '#f59e0b';
+      return '#22c55e';
+    };
+    const anchorRootId = graphRenderPlan.anchorNodeId
+      ? buildKnowledgeNodePath(subjectNodes, graphRenderPlan.anchorNodeId)[0]?.id || null
+      : null;
+    const getNodeOpacity = (nodeId: string) => {
+      if (nodeId === selectedNodeId || focusPathIds.has(nodeId)) return 1;
+      const nodeRootId = buildKnowledgeNodePath(subjectNodes, nodeId)[0]?.id || null;
+      return nodeRootId && nodeRootId === anchorRootId ? 0.82 : 0.56;
     };
 
-    // Draw links (using curves for tree)
     const linkGenerator = d3.linkHorizontal<any, any>()
-      .x((d: any) => d.y)
-      .y((d: any) => d.x);
+      .x((item: any) => item.y)
+      .y((item: any) => item.x);
 
-    g.append('g')
-      .attr('class', 'links')
-      .selectAll('path')
-      .data(linksData)
+    const linkSelection = linksLayer
+      .selectAll<SVGPathElement, any>('path.graph-link')
+      .data(linksData, (item: any) => `${item.source.data.id}->${item.target.data.id}`);
+
+    linkSelection
+      .exit()
+      .transition()
+      .duration(180)
+      .attr('opacity', 0)
+      .remove();
+
+    const linkEnter = linkSelection
       .enter()
       .append('path')
-      .attr('d', linkGenerator as any)
+      .attr('class', 'graph-link')
       .attr('fill', 'none')
-      .attr('stroke', '#334155')
       .attr('stroke-width', 1.5)
-      .attr('opacity', 0.6);
+      .attr('opacity', 0);
 
-    // Draw nodes
-    const node = g.append('g')
-      .attr('class', 'nodes')
-      .selectAll('g')
-      .data(nodesData)
-      .enter()
-      .append('g')
-      .attr('transform', (d: any) => `translate(${d.y},${d.x})`)
-      .style('cursor', 'pointer')
-      .on('click', (event, d: any) => {
-        event.stopPropagation();
-        if (d.data.isVirtual) return;
-        selectGraphNode(d.data.id);
+    linkEnter
+      .merge(linkSelection as any)
+      .transition()
+      .duration(220)
+      .attr('d', linkGenerator as any)
+      .attr('stroke', (item: any) => {
+        const sourceId = item.source.data?.id;
+        const targetId = item.target.data?.id;
+        return focusPathIds.has(sourceId) && focusPathIds.has(targetId) ? '#6366f1' : '#334155';
       })
-      .on('dblclick', (event, d: any) => {
-        event.stopPropagation();
-        if (zoomRef.current && svgRef.current) {
-          const currentTransform = d3.zoomTransform(svgRef.current);
-          const scale = currentTransform.k;
-          d3.select(svgRef.current).transition().duration(750).call(
-            zoomRef.current.transform,
-            d3.zoomIdentity.translate(width / 2 - d.y * scale, height / 2 - d.x * scale).scale(scale)
-          );
-        }
+      .attr('opacity', (item: any) => {
+        const sourceId = item.source.data?.id;
+        const targetId = item.target.data?.id;
+        return focusPathIds.has(sourceId) && focusPathIds.has(targetId) ? 0.9 : 0.35;
       });
 
-    // Node Background Box
-    node.append('rect')
-      .attr('rx', 6)
-      .attr('ry', 6)
+    const nodeSelection = nodesLayer
+      .selectAll<SVGGElement, any>('g.graph-node')
+      .data(nodesData, (item: any) => item.data.id);
+
+    nodeSelection
+      .exit()
+      .transition()
+      .duration(180)
+      .attr('opacity', 0)
+      .remove();
+
+    const nodeEnter = nodeSelection
+      .enter()
+      .append('g')
+      .attr('class', 'graph-node')
+      .attr('opacity', 0)
+      .attr('transform', (item: any) => `translate(${item.y},${item.x})`);
+
+    nodeEnter.append('rect').attr('class', 'node-box');
+    nodeEnter.append('circle').attr('class', 'node-indicator');
+    nodeEnter.append('text').attr('class', 'node-label');
+    nodeEnter.append('title');
+    const toggleEnter = nodeEnter.append('g').attr('class', 'node-toggle');
+    toggleEnter.append('circle').attr('class', 'toggle-circle');
+    toggleEnter.append('text').attr('class', 'toggle-symbol');
+    toggleEnter.append('text').attr('class', 'toggle-count');
+
+    const nodeMerge = nodeEnter.merge(nodeSelection as any);
+
+    nodeMerge
+      .style('cursor', 'pointer')
+      .on('click', (event, item: any) => {
+        event.stopPropagation();
+        if (item.data.isVirtual) return;
+        selectGraphNode(item.data.id);
+      })
+      .on('dblclick', (event, item: any) => {
+        event.stopPropagation();
+        if (!zoomRef.current || !svgRef.current) return;
+        const transform = d3.zoomTransform(svgRef.current);
+        const scale = transform.k;
+        d3.select(svgRef.current).transition().duration(320).call(
+          zoomRef.current.transform,
+          d3.zoomIdentity.translate(width / 2 - item.y * scale, height / 2 - item.x * scale).scale(scale)
+        );
+      })
+      .transition()
+      .duration(220)
+      .attr('opacity', 1)
+      .attr('transform', (item: any) => `translate(${item.y},${item.x})`);
+
+    nodeMerge
+      .select<SVGRectElement>('rect.node-box')
+      .attr('rx', 8)
+      .attr('ry', 8)
       .attr('y', -14)
-      .attr('x', -50)
-      .attr('width', 100)
+      .attr('x', -56)
+      .attr('width', 112)
       .attr('height', 28)
-      .attr('fill', (d: any) => d.data.isVirtual ? '#1e293b' : '#0f172a')
-      .attr('stroke', (d: any) => d.data.id === selectedNodeId ? '#3b82f6' : '#334155')
-      .attr('stroke-width', (d: any) => d.data.id === selectedNodeId ? 2 : 1)
-      .attr('class', 'node-box');
+      .attr('fill', (item: any) => item.data.isVirtual ? '#1e293b' : '#0f172a')
+      .attr('stroke', (item: any) => {
+        if (item.data.id === selectedNodeId) return '#3b82f6';
+        if (focusPathIds.has(item.data.id)) return '#6366f1';
+        return '#334155';
+      })
+      .attr('stroke-width', (item: any) => item.data.id === selectedNodeId ? 2.2 : focusPathIds.has(item.data.id) ? 1.4 : 1)
+      .attr('opacity', (item: any) => getNodeOpacity(item.data.id));
 
-    // Node Mastery Indicator
-    node.filter((d: any) => !d.data.isVirtual).append('circle')
+    nodeMerge
+      .select<SVGCircleElement>('circle.node-indicator')
       .attr('r', 4)
-      .attr('cx', -50)
+      .attr('cx', -56)
       .attr('cy', 0)
-      .attr('fill', (d: any) => getNodeColor(getNodeMastery(d.data.id)))
+      .attr('fill', (item: any) => item.data.isVirtual ? '#64748b' : getNodeColor(nodeMasteryMap.get(item.data.id) ?? null))
       .attr('stroke', '#0f172a')
-      .attr('stroke-width', 1.5);
+      .attr('stroke-width', 1.5)
+      .attr('opacity', (item: any) => item.data.isVirtual ? 0 : 1);
 
-    // Text inside the box
-    node.append('text')
+    nodeMerge
+      .select<SVGTextElement>('text.node-label')
       .attr('dy', '.35em')
       .attr('text-anchor', 'middle')
-      .attr('fill', (d: any) => d.data.isVirtual ? '#94a3b8' : '#f1f5f9')
-      .attr('class', 'text-[10px] font-medium select-none pointer-events-none')
-      .text((d: any) => {
-        const name = d.data.name;
+      .attr('fill', (item: any) => item.data.isVirtual ? '#94a3b8' : '#f1f5f9')
+      .attr('class', 'node-label text-[10px] font-medium select-none pointer-events-none')
+      .attr('opacity', (item: any) => getNodeOpacity(item.data.id))
+      .text((item: any) => {
+        const name = item.data.name;
         return name.length > 8 ? name.substring(0, 7) + '...' : name;
       });
 
-    // Tooltip
-    node.append('title')
-      .text((d: any) => d.data.name);
+    nodeMerge.select('title').text((item: any) => item.data.name);
 
-    // Expand/Collapse Button
-    const toggleBtn = node.filter((d: any) => d._children && d._children.length > 0)
-      .append('g')
+    const toggleMerge = nodeMerge
+      .select<SVGGElement>('g.node-toggle')
       .attr('transform', 'translate(50, 0)')
       .style('cursor', 'pointer')
-      .on('click', (event, d: any) => {
+      .style('display', (item: any) => {
+        const childCount = subjectChildrenByParent.get(item.data.id)?.length || 0;
+        const hiddenCount = graphRenderPlan.collapsedSummaryByNodeId[item.data.id]?.hiddenDescendantCount || 0;
+        return !item.data.isVirtual && (childCount > 0 || hiddenCount > 0) ? null : 'none';
+      })
+      .on('click', (event, item: any) => {
         event.stopPropagation();
-        if (collapsedIds.current.has(d.data.id)) {
-          collapsedIds.current.delete(d.data.id);
-        } else {
-          collapsedIds.current.add(d.data.id);
-        }
-        setRenderTrigger(prev => prev + 1);
+        if (item.data.isVirtual) return;
+        toggleCollapsedNode(item.data.id);
       });
 
-    toggleBtn.append('circle')
-      .attr('r', 6)
+    toggleMerge
+      .select<SVGCircleElement>('circle.toggle-circle')
+      .attr('r', 7)
       .attr('fill', '#1e293b')
-      .attr('stroke', '#334155')
-      .attr('stroke-width', 1.5)
-      .on('mouseover', function() { d3.select(this).attr('stroke', '#3b82f6') })
-      .on('mouseout', function() { d3.select(this).attr('stroke', '#334155') });
+      .attr('stroke', (item: any) => focusPathIds.has(item.data.id) ? '#6366f1' : '#334155')
+      .attr('stroke-width', 1.4);
 
-    toggleBtn.append('text')
+    toggleMerge
+      .select<SVGTextElement>('text.toggle-symbol')
       .attr('dy', '0.3em')
       .attr('text-anchor', 'middle')
+      .attr('fill', '#cbd5e1')
+      .attr('class', 'toggle-symbol text-[10px] select-none font-bold pointer-events-none')
+      .text((item: any) => effectiveCollapsedSet.has(item.data.id) ? '+' : '-');
+
+    toggleMerge
+      .select<SVGTextElement>('text.toggle-count')
+      .attr('x', 12)
+      .attr('y', 4)
       .attr('fill', '#94a3b8')
-      .attr('class', 'text-[10px] select-none font-bold pointer-events-none')
-      .text((d: any) => collapsedIds.current.has(d.data.id) ? '+' : '-');
+      .attr('class', 'toggle-count text-[9px] font-semibold pointer-events-none')
+      .text((item: any) => {
+        const hiddenCount = graphRenderPlan.collapsedSummaryByNodeId[item.data.id]?.hiddenDescendantCount || 0;
+        return hiddenCount > 0 ? `${hiddenCount}` : '';
+      });
+
+    const getSmartTransform = () => {
+      const preferredFocusNodeId = graphRenderPlan.preferredFocusNodeId;
+      const focusNode = preferredFocusNodeId
+        ? nodesData.find((node: any) => !node.data?.isVirtual && node.data.id === preferredFocusNodeId)
+        : null;
+
+      if (focusNode) {
+        const scale = nodesData.length <= 36 ? 1 : nodesData.length <= 72 ? 0.84 : 0.7;
+        return d3.zoomIdentity
+          .translate(width / 2 - (focusNode.y ?? 0) * scale, height / 2 - (focusNode.x ?? 0) * scale)
+          .scale(scale);
+      }
+
+      const minX = d3.min(nodesData, (node: any) => node.x) ?? 0;
+      const maxX = d3.max(nodesData, (node: any) => node.x) ?? 0;
+      const minY = d3.min(nodesData, (node: any) => node.y) ?? 0;
+      const maxY = d3.max(nodesData, (node: any) => node.y) ?? 0;
+      const graphWidth = Math.max(1, maxY - minY + 180);
+      const graphHeight = Math.max(1, maxX - minX + 120);
+      const scale = Math.max(0.24, Math.min(1, Math.min((width - 48) / graphWidth, (height - 48) / graphHeight)));
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+
+      return d3.zoomIdentity
+        .translate(width / 2 - centerY * scale, height / 2 - centerX * scale)
+        .scale(scale);
+    };
+
+    const shouldFitToAnchor = fitToAnchorRef.current;
+    const targetTransform =
+      restoreViewportRef.current && persistedViewportRef.current && !shouldFitToAnchor
+        ? d3.zoomIdentity.translate(persistedViewportRef.current.x, persistedViewportRef.current.y).scale(persistedViewportRef.current.k)
+        : currentTransform && !shouldFitToAnchor
+          ? d3.zoomIdentity.translate(currentTransform.x, currentTransform.y).scale(currentTransform.k)
+          : getSmartTransform();
+
+    if (zoomRef.current) {
+      const zoomTarget = shouldFitToAnchor || restoreViewportRef.current
+        ? svg.transition().duration(260)
+        : svg;
+      zoomTarget.call(zoomRef.current.transform, targetTransform);
+    } else {
+      g.attr('transform', targetTransform.toString());
+    }
+    latestViewportRef.current = { x: targetTransform.x, y: targetTransform.y, k: targetTransform.k };
+    if (restoreViewportRef.current) {
+      restoreViewportRef.current = false;
+    }
+    if (fitToAnchorRef.current) {
+      fitToAnchorRef.current = false;
+    }
 
     // No simulation needed for tree layout
 
     return () => {
       // Cleanup
     };
-  }, [renderTrigger, selectGraphNode, selectedNodeId, state.currentSubject, state.knowledgeNodes, state.memories]);
+  }, [
+    graphRenderPlan,
+    nodeMasteryMap,
+    persistViewport,
+    selectGraphNode,
+    selectedNodeId,
+    subjectChildrenByParent,
+    subjectNodes,
+    toggleCollapsedNode,
+    effectiveCollapsedSet,
+    focusPathIds,
+    state.currentSubject,
+    viewMode,
+  ]);
 
   const handleAdjust = async () => {
     if (!command.trim() && !image) return;
@@ -529,16 +812,34 @@ export function KnowledgeGraph() {
   );
 
   const renderOutline = (parentId: string | null, depth: number = 0) => {
-    const children = state.knowledgeNodes.filter(n => n.subject === state.currentSubject && n.parentId === parentId);
+    const children = visibleChildrenByParent.get(parentId) || [];
     return children.map(node => (
       <div key={node.id} style={{ marginLeft: `${depth * 20}px` }} className="group">
         <div className={clsx(
-          "flex items-center gap-2 py-1 px-2 rounded hover:bg-slate-800 cursor-pointer",
-          selectedNodeId === node.id && "bg-indigo-500/20 text-indigo-400"
+          "flex items-center gap-2 py-1 px-2 rounded transition-colors hover:bg-slate-800 cursor-pointer",
+          selectedNodeId === node.id && "bg-indigo-500/20 text-indigo-300",
+          focusPathIds.has(node.id) && selectedNodeId !== node.id && "bg-indigo-500/10 text-indigo-100"
         )} onClick={() => selectGraphNode(node.id)}>
-          <span className="text-slate-500">
+          <button
+            onClick={(event) => {
+              event.stopPropagation();
+              const childCount = subjectChildrenByParent.get(node.id)?.length || 0;
+              const hiddenCount = graphRenderPlan.collapsedSummaryByNodeId[node.id]?.hiddenDescendantCount || 0;
+              if (childCount === 0 && hiddenCount === 0) return;
+              toggleCollapsedNode(node.id);
+            }}
+            className={clsx(
+              "relative inline-flex h-5 w-5 items-center justify-center rounded border text-[10px] font-bold text-transparent transition-colors",
+              (subjectChildrenByParent.get(node.id)?.length || 0) > 0 || (graphRenderPlan.collapsedSummaryByNodeId[node.id]?.hiddenDescendantCount || 0) > 0
+                ? "border-slate-700 bg-slate-900 text-slate-300 hover:border-indigo-500/50"
+                : "border-transparent text-slate-700"
+            )}
+          >
             {state.knowledgeNodes.some(n => n.parentId === node.id) ? '▾' : '•'}
-          </span>
+            <span className="absolute inset-0 flex items-center justify-center text-slate-300">
+              {effectiveCollapsedSet.has(node.id) ? '+' : '−'}
+            </span>
+          </button>
           {editingNodeId === node.id ? (
             <input
               type="text"
@@ -558,6 +859,11 @@ export function KnowledgeGraph() {
               setEditNodeName(node.name);
             }}>{node.name}</span>
           )}
+          {(graphRenderPlan.collapsedSummaryByNodeId[node.id]?.hiddenDescendantCount || 0) > 0 && (
+            <span className="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-400">
+              +{graphRenderPlan.collapsedSummaryByNodeId[node.id].hiddenDescendantCount}
+            </span>
+          )}
           <button 
             onClick={(e) => {
               e.stopPropagation();
@@ -576,7 +882,7 @@ export function KnowledgeGraph() {
             添加子节点
           </button>
         </div>
-        {renderOutline(node.id, depth + 1)}
+        {!effectiveCollapsedSet.has(node.id) && renderOutline(node.id, depth + 1)}
       </div>
     ));
   };
@@ -587,23 +893,30 @@ export function KnowledgeGraph() {
         <div className="flex items-center gap-3">
           <h2 className="text-sm md:text-base font-bold text-white flex items-center gap-2 uppercase tracking-tight">
             <BrainCircuit className="w-4 h-4 text-indigo-400" />
-            <span className="truncate">{state.currentSubject} 知识图谱</span>
+            <span className="truncate">{state.currentSubject} 知识导图</span>
           </h2>
+          {graphRenderPlan.hiddenNodeCount > 0 && (
+            <span className="hidden rounded-full border border-slate-800 bg-slate-900 px-2 py-1 text-[10px] font-semibold text-slate-400 md:inline-flex">
+              已自动折叠 {graphRenderPlan.hiddenNodeCount} 个节点
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <div className="flex bg-slate-900/50 border border-slate-800 p-0.5 rounded-lg">
             {viewMode === 'graph' && (
               <button
                 onClick={() => {
-                  if (svgRef.current && zoomRef.current) {
-                    d3.select(svgRef.current).transition().duration(750).call(zoomRef.current.transform, d3.zoomIdentity);
-                  }
+                  latestViewportRef.current = null;
+                  restoreViewportRef.current = true;
+                  fitToAnchorRef.current = true;
+                  persistSubjectGraphView({ viewport: null });
+                  setRenderTrigger((prev) => prev + 1);
                 }}
                 className="hidden md:flex items-center gap-1 px-2 py-1 text-[9px] font-black text-slate-500 hover:text-slate-300 transition-colors uppercase tracking-widest"
-                title="重置缩放和位置"
+                title="重置视图"
               >
                 <Maximize className="w-3 h-3" />
-                RESET
+                重置
               </button>
             )}
             {state.lastNodesState && (
@@ -613,26 +926,37 @@ export function KnowledgeGraph() {
                 title="撤销上次 AI 调整"
               >
                 <RotateCcw className="w-3 h-3" />
-                UNDO
+                撤销
               </button>
             )}
             <button
-              onClick={() => setViewMode('graph')}
+              onClick={() => {
+                setViewMode('graph');
+                restoreViewportRef.current = true;
+                fitToAnchorRef.current = false;
+                persistSubjectGraphView({ viewMode: 'graph' });
+                setRenderTrigger((prev) => prev + 1);
+              }}
               className={clsx(
                 "px-2 md:px-3 py-1 text-[9px] md:text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
                 viewMode === 'graph' ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"
               )}
             >
-              GRAPH
+              导图
             </button>
             <button
-              onClick={() => setViewMode('outline')}
+              onClick={() => {
+                setViewMode('outline');
+                fitToAnchorRef.current = false;
+                persistSubjectGraphView({ viewMode: 'outline' });
+                setRenderTrigger((prev) => prev + 1);
+              }}
               className={clsx(
                 "px-2 md:px-3 py-1 text-[9px] md:text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
                 viewMode === 'outline' ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"
               )}
             >
-              OUTLINE
+              大纲
             </button>
           </div>
         </div>
@@ -797,7 +1121,7 @@ export function KnowledgeGraph() {
                 {image && (
                   <div className="relative w-16 h-16 rounded-lg overflow-hidden border border-slate-700 ml-10">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={image} alt="Preview" className="w-full h-full object-cover" />
+                    <img src={image} alt="结构图预览" className="w-full h-full object-cover" />
                     <button
                       onClick={() => setImage(null)}
                       className="absolute top-1 right-1 bg-black/50 text-white rounded-full w-4 h-4 flex items-center justify-center text-xs"

@@ -2,17 +2,28 @@
 
 import React, { useState, useMemo } from 'react';
 import { clearLocalAppData, useAppContext } from '@/lib/store';
-import { Shield, Trash2, RefreshCw, AlertTriangle, Sparkles, ShieldAlert, Filter, Database, Search, Zap, Loader2, X, BarChart2 } from 'lucide-react';
+import { Trash2, RefreshCw, AlertTriangle, Sparkles, ShieldAlert, Zap, Loader2, BarChart2, Network } from 'lucide-react';
+import {
+  buildSubjectGraphImportPlan,
+  buildSubjectGraphMigrationPlan,
+  getSubjectGraphImportModeLabel,
+  getSubjectGraphImportOverview,
+  SUBJECT_GRAPH_SEED_VERSION,
+  type SubjectGraphImportMode,
+} from '@/lib/subject-graph-import';
 import { Memory, KnowledgeNode, Subject } from '@/lib/types';
-import clsx from 'clsx';
 import { v4 as uuidv4 } from 'uuid';
+
+const ALL_SUBJECTS: Subject[] = ['语文', '数学', '英语', '物理', '化学', '生物'];
 
 export default function DataGovernanceSettings() {
   const { state, dispatch } = useAppContext();
   const [subjectFilter, setSubjectFilter] = useState<string>('all');
-  const [isDeepScanning, setIsDeepScanning] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isGraphImporting, setIsGraphImporting] = useState(false);
+  const [graphImportTarget, setGraphImportTarget] = useState<Subject | null>(null);
   const [modalConfig, setModalConfig] = useState<{ isOpen: boolean, title: string, message: string, type: 'alert' | 'confirm', onConfirm?: () => void }>({ isOpen: false, title: '', message: '', type: 'alert' });
+  const graphImportOverview = useMemo(() => getSubjectGraphImportOverview(), []);
 
   const showAlert = (title: string, message: string) => {
     setModalConfig({ isOpen: true, title, message, type: 'alert' });
@@ -22,11 +33,7 @@ export default function DataGovernanceSettings() {
     setModalConfig({ isOpen: true, title, message, type: 'confirm', onConfirm });
   };
 
-  const subjects = Array.from(new Set([
-    ...state.memories.map(m => m.subject),
-    ...state.knowledgeNodes.map(n => n.subject),
-    ...state.textbooks.map(t => t.subject)
-  ]));
+  const subjects = ALL_SUBJECTS;
 
   const duplicates = useMemo(() => {
     const memoryDupes: Memory[] = [];
@@ -165,6 +172,110 @@ export default function DataGovernanceSettings() {
       dispatch({ type: 'DELETE_SUBJECT_TEXTBOOKS', payload: { subject: subjectFilter as Subject } });
       showAlert('成功', `【${subjectFilter}】学科课本已清空。`);
     });
+  };
+
+  const handleRunInitialSubjectGraphMigration = () => {
+    setIsGraphImporting(true);
+    try {
+      const migrationPlan = buildSubjectGraphMigrationPlan(state.knowledgeNodes);
+
+      if (migrationPlan.nodesToAdd.length > 0) {
+        dispatch({ type: 'BATCH_ADD_NODES', payload: migrationPlan.nodesToAdd });
+      }
+
+      dispatch({
+        type: 'ADD_LOG',
+        payload: {
+          type: 'ingestion',
+          model: 'subject-graph-seed',
+          prompt: `manual subject-graph migration ${migrationPlan.version}`,
+          response: `手动执行学科导图初始化迁移：新增 ${migrationPlan.addedCount} 个节点。`,
+          subject: state.currentSubject,
+          metadata: {
+            mode: 'manual_initial_migration',
+            version: migrationPlan.version,
+            addedCount: migrationPlan.addedCount,
+            subjects: migrationPlan.plans.map((plan) => ({
+              subject: plan.subject,
+              addedCount: plan.addedCount,
+              totalSeedNodeCount: plan.totalSeedNodeCount,
+              sourceFileName: plan.sourceFileName,
+            })),
+            missingSubjects: migrationPlan.missingSubjects,
+            invalidSources: migrationPlan.invalidSources,
+          },
+        },
+      });
+
+      dispatch({ type: 'SET_SUBJECT_GRAPH_SEED_VERSION', payload: migrationPlan.version });
+
+      const versionHint =
+        state.subjectGraphSeedVersion === SUBJECT_GRAPH_SEED_VERSION
+          ? '当前版本迁移标记已存在，本次只补齐缺失节点。'
+          : '已写入当前版本迁移标记。';
+      showAlert(
+        '学科导图迁移完成',
+        `本次新增 ${migrationPlan.addedCount} 个导图节点。\n\n${versionHint}\n缺失学科：${migrationPlan.missingSubjects.join('、') || '无'}`
+      );
+    } finally {
+      setIsGraphImporting(false);
+    }
+  };
+
+  const runSubjectGraphImport = (subject: Subject, mode: SubjectGraphImportMode) => {
+    setGraphImportTarget(null);
+    setIsGraphImporting(true);
+
+    try {
+      const importPlan = buildSubjectGraphImportPlan(state.knowledgeNodes, subject, mode);
+      if (importPlan.missingSource) {
+        showAlert('暂无可用导图源', `【${subject}】当前没有可用的静态导图种子，暂时无法执行导入。`);
+        return;
+      }
+
+      const existingSubjectNodeCount = state.knowledgeNodes.filter((node) => node.subject === subject).length;
+      if (mode === 'rebuild_subject') {
+        dispatch({ type: 'DELETE_SUBJECT_NODES', payload: { subject } });
+      }
+      if (importPlan.nodesToAdd.length > 0) {
+        dispatch({ type: 'BATCH_ADD_NODES', payload: importPlan.nodesToAdd });
+      }
+
+      dispatch({
+        type: 'ADD_LOG',
+        payload: {
+          type: 'ingestion',
+          model: 'subject-graph-seed',
+          prompt: `subject-graph import ${subject} ${mode}`,
+          response: `学科导图导入完成：${subject} - ${getSubjectGraphImportModeLabel(mode)}，新增 ${importPlan.addedCount} 个节点。`,
+          subject,
+          metadata: {
+            mode,
+            modeLabel: getSubjectGraphImportModeLabel(mode),
+            subject,
+            sourceFileName: importPlan.sourceFileName,
+            sourceBankId: importPlan.sourceBankId,
+            addedCount: importPlan.addedCount,
+            skippedCount: importPlan.skippedCount,
+            totalSeedNodeCount: importPlan.totalSeedNodeCount,
+            existingSubjectNodeCount,
+            skippedReasonCounts: importPlan.skippedReasonCounts,
+            invalidSources: importPlan.invalidSources,
+          },
+        },
+      });
+
+      showAlert(
+        '学科导图导入完成',
+        `【${subject}】已按“${getSubjectGraphImportModeLabel(mode)}”执行导入。\n新增节点：${importPlan.addedCount}\n跳过节点：${importPlan.skippedCount}`
+      );
+    } finally {
+      setIsGraphImporting(false);
+    }
+  };
+
+  const handlePromptSubjectGraphImport = () => {
+    setGraphImportTarget((subjectFilter === 'all' ? state.currentSubject : subjectFilter) as Subject);
   };
 
   const handleDeepCleanup = () => {
@@ -315,6 +426,113 @@ export default function DataGovernanceSettings() {
           {state.memories.length === 0 && (
             <p className="text-xs text-slate-500 text-center py-2">暂无记忆数据</p>
           )}
+        </div>
+      </section>
+
+      <section className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-sm space-y-5">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div className="space-y-2">
+            <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-[11px] font-semibold text-emerald-300">
+              <Network className="h-3.5 w-3.5" />
+              学科导图导入
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-white">静态导图种子识别与迁移</h3>
+              <p className="text-sm text-slate-400">
+                已识别 {graphImportOverview.availableSubjects.length} 科可导入，语文源缺失；当前跳过 {graphImportOverview.skippedSources.length} 份重复/无效源。
+              </p>
+            </div>
+          </div>
+          <div className="rounded-2xl border border-slate-800 bg-slate-950 px-4 py-3 text-right">
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">迁移版本</p>
+            <p className="mt-1 text-sm font-semibold text-white">{state.subjectGraphSeedVersion || '未执行'}</p>
+            <p className="mt-1 text-xs text-slate-500">目标版本：{SUBJECT_GRAPH_SEED_VERSION}</p>
+          </div>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-3">
+          <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">可导入学科</p>
+            <p className="mt-2 text-2xl font-black text-white">{graphImportOverview.availableSubjects.length}</p>
+            <p className="mt-2 text-xs text-slate-400">{graphImportOverview.availableSubjects.join('、')}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">缺失学科</p>
+            <p className="mt-2 text-2xl font-black text-amber-300">{graphImportOverview.missingSubjects.length}</p>
+            <p className="mt-2 text-xs text-slate-400">{graphImportOverview.missingSubjects.join('、') || '无'}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">跳过源文件</p>
+            <p className="mt-2 text-2xl font-black text-rose-300">{graphImportOverview.skippedSources.length}</p>
+            <p className="mt-2 text-xs text-slate-400">
+              {graphImportOverview.skippedSources.map((item) => item.fileName).join('、') || '无'}
+            </p>
+          </div>
+        </div>
+
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {graphImportOverview.supportedSources.map((source) => (
+            <div key={source.fileName} className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-white">{source.resolvedSubject}</p>
+                  <p className="text-xs text-slate-500">{source.fileName}</p>
+                </div>
+                <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-300">
+                  可导入
+                </span>
+              </div>
+              <div className="mt-4 flex items-end justify-between">
+                <div>
+                  <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">有效节点</p>
+                  <p className="mt-1 text-xl font-black text-white">{source.validNodeCount}</p>
+                </div>
+                <p className="text-xs text-slate-500">bankId: {source.bankId}</p>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-slate-400">{source.reason}</p>
+            </div>
+          ))}
+          {graphImportOverview.skippedSources.map((source) => (
+            <div key={source.fileName} className="rounded-2xl border border-rose-900/30 bg-rose-950/10 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-white">{source.fileName}</p>
+                  <p className="text-xs text-slate-500">不会参与导入</p>
+                </div>
+                <span className="rounded-full border border-rose-500/20 bg-rose-500/10 px-2.5 py-1 text-[11px] font-semibold text-rose-300">
+                  已跳过
+                </span>
+              </div>
+              <p className="mt-4 text-xs leading-5 text-slate-400">{source.reason}</p>
+            </div>
+          ))}
+        </div>
+
+        <div className="rounded-2xl border border-slate-800 bg-slate-950 p-4">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+            <div className="space-y-2">
+              <p className="text-sm font-semibold text-white">导入操作</p>
+              <p className="text-xs leading-5 text-slate-400">
+                初始化迁移始终按“仅补缺”执行；当前学科重跑支持“仅补缺”和“整科重建”。如果上方未选择学科，将默认使用当前学科：{state.currentSubject}。
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <button
+                onClick={handleRunInitialSubjectGraphMigration}
+                disabled={isGraphImporting}
+                className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-sm font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isGraphImporting ? '处理中...' : '执行初始化迁移'}
+              </button>
+              <button
+                onClick={handlePromptSubjectGraphImport}
+                disabled={isGraphImporting}
+                className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-4 py-2.5 text-sm font-semibold text-indigo-300 transition hover:bg-indigo-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                重跑当前学科导入
+              </button>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -516,6 +734,50 @@ export default function DataGovernanceSettings() {
           </button>
         </div>
       </section>
+
+      {graphImportTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
+            <div className="p-6">
+              <h3 className="flex items-center gap-2 text-lg font-bold text-white">
+                <Network className="h-5 w-5 text-emerald-400" />
+                选择导入模式
+              </h3>
+              <p className="mt-2 text-sm leading-6 text-slate-300">
+                准备为【{graphImportTarget}】执行导图导入。请选择本次操作模式。
+              </p>
+              <div className="mt-5 grid gap-3">
+                <button
+                  onClick={() => runSubjectGraphImport(graphImportTarget, 'fill_missing')}
+                  className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 text-left transition hover:bg-emerald-500/20"
+                >
+                  <p className="text-sm font-semibold text-emerald-300">仅补缺</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                    只补入缺失的稳定 id 节点，不删除你现有的任何导图节点。
+                  </p>
+                </button>
+                <button
+                  onClick={() => runSubjectGraphImport(graphImportTarget, 'rebuild_subject')}
+                  className="rounded-2xl border border-rose-500/30 bg-rose-500/10 p-4 text-left transition hover:bg-rose-500/20"
+                >
+                  <p className="text-sm font-semibold text-rose-300">整科重建</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                    先清空该学科当前所有导图节点，再按静态种子完整重建。
+                  </p>
+                </button>
+              </div>
+            </div>
+            <div className="flex justify-end border-t border-slate-800 bg-slate-950/50 px-6 py-4">
+              <button
+                onClick={() => setGraphImportTarget(null)}
+                className="rounded-xl px-4 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Custom Modal */}
       {modalConfig.isOpen && (

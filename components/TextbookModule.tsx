@@ -5,8 +5,8 @@ import { BookOpen, FileText, Trash2 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { v4 as uuidv4 } from 'uuid';
 import { useAppContext } from '@/lib/store';
-import { generateTextbookFramework, getEmbedding, processTextbookPage, processTextbookPDF } from '@/lib/ai';
-import { parseDocx, parsePDF } from '@/lib/file-parsers';
+import { generateTextbookFramework, getEmbedding, processTextbookPage, processTextbookPDF, shouldUsePageImageOcrForTextbookPdf } from '@/lib/ai';
+import { parseDocx, parsePDF, renderPdfPagesToImages } from '@/lib/file-parsers';
 import { createMemoryPayload } from '@/lib/data/commands';
 import { Textbook, TextbookAnnotation } from '@/lib/types';
 import {
@@ -244,33 +244,58 @@ export function TextbookModule() {
           await saveFile(fileId, arrayBuffer);
 
           if (enableOCR) {
-            const reader = new FileReader();
-            const base64 = await new Promise<string>((resolve) => {
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.readAsDataURL(file);
-            });
-            const ocrResults = await processTextbookPDF(base64, state.settings, logCallback);
-            const fallbackPages = ocrResults.length === 0 ? await parsePDF(file) : [];
-            const pagePayloads =
-              ocrResults.length > 0
-                ? ocrResults.map((item) => ({ pageNumber: item.pageNumber, textContent: item.content }))
-                : fallbackPages;
+            if (shouldUsePageImageOcrForTextbookPdf(state.settings.parseModel, state.settings)) {
+              const renderedPages = await renderPdfPagesToImages(file);
+              setUploadProgress((current) => ({
+                current: current.current,
+                total: Math.max(current.total, fileList.length + renderedPages.length - 1),
+              }));
 
-            setUploadProgress((current) => ({
-              current: current.current,
-              total: Math.max(current.total, fileList.length + pagePayloads.length - 1),
-            }));
-
-            for (const page of pagePayloads) {
-              const embedding = await getEmbedding(page.textContent, state.settings);
-              allPages.push({
-                id: uuidv4(),
-                pageNumber: page.pageNumber,
-                content: page.textContent,
-                imageUrl: '',
-                embedding,
+              for (const page of renderedPages) {
+                const { content, embedding } = await processTextbookPage(
+                  page.imageUrl,
+                  page.pageNumber,
+                  state.settings,
+                  logCallback
+                );
+                allPages.push({
+                  id: uuidv4(),
+                  pageNumber: page.pageNumber,
+                  content,
+                  imageUrl: '',
+                  embedding,
+                });
+                setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
+              }
+            } else {
+              const reader = new FileReader();
+              const base64 = await new Promise<string>((resolve) => {
+                reader.onloadend = () => resolve(reader.result as string);
+                reader.readAsDataURL(file);
               });
-              setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
+              const ocrResults = await processTextbookPDF(base64, state.settings, logCallback);
+              const fallbackPages = ocrResults.length === 0 ? await parsePDF(file) : [];
+              const pagePayloads =
+                ocrResults.length > 0
+                  ? ocrResults.map((item) => ({ pageNumber: item.pageNumber, textContent: item.content }))
+                  : fallbackPages;
+
+              setUploadProgress((current) => ({
+                current: current.current,
+                total: Math.max(current.total, fileList.length + pagePayloads.length - 1),
+              }));
+
+              for (const page of pagePayloads) {
+                const embedding = await getEmbedding(page.textContent, state.settings);
+                allPages.push({
+                  id: uuidv4(),
+                  pageNumber: page.pageNumber,
+                  content: page.textContent,
+                  imageUrl: '',
+                  embedding,
+                });
+                setUploadProgress((current) => ({ ...current, current: current.current + 1 }));
+              }
             }
           } else {
             const pdfPages = await parsePDF(file);
